@@ -3813,7 +3813,11 @@ void ProcessPendingSceneLayerDestroy(WPSceneScriptHost::Opaque* opaque) {
 
         opaque->scene->objectRuntimeNodes.erase(layer_id);
         opaque->scene->ClearLayerParentBinding(layer_id);
-        opaque->scene->layerLocalVisibility.erase(layer_id);
+        // The SceneObject stays in objectList; reset its visibility to the
+        // default so a later dynamic layer reusing this id starts visible.
+        if (auto* object = opaque->scene->FindSceneObject(layer_id)) {
+            object->set_local_visible(true);
+        }
         if (auto sound_it = opaque->scene->objectRuntimeSoundHandles.find(layer_id);
             sound_it != opaque->scene->objectRuntimeSoundHandles.end()) {
             if (opaque->scene->soundManager != nullptr) {

@@ -246,7 +246,6 @@ public:
     std::unordered_map<int32_t, std::unique_ptr<SceneObject>> sceneObjects;
     std::unordered_map<int32_t, SceneNode*> layerNodes;
     std::unordered_map<int32_t, LayerParentBinding> layerParentBindings;
-    std::unordered_map<int32_t, bool>    layerLocalVisibility;
     std::unordered_map<int32_t, std::vector<SceneNode*>> objectRuntimeNodes;
     std::unordered_map<int32_t, std::vector<std::string>> objectRuntimeCameraNames;
     std::unordered_map<int32_t, std::vector<std::string>> objectRuntimeRenderTargets;

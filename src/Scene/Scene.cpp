@@ -54,25 +54,15 @@ Eigen::Matrix4f GfxOrtho18(float l, float r, float b, float t, float n, float f)
     return cam;
 }
 
-bool IsLayerVisibleImpl(const Scene& scene, int32_t layer_id, std::unordered_set<int32_t>& visiting) {
+bool IsLayerVisibleImpl(const Scene& scene, int32_t layer_id) {
     if (layer_id == 0) return true;
-    if (!visiting.insert(layer_id).second) return true;
-
+    // SceneObject::flags bit0 plus the object parent walk is the only
+    // visibility source (0x140185010). Layers with no authored object
+    // default to visible.
     if (const auto* object = scene.FindSceneObject(layer_id)) {
         return object->EffectiveVisible();
     }
-
-    const auto visible_it = scene.layerLocalVisibility.find(layer_id);
-    const bool local_visible =
-        visible_it == scene.layerLocalVisibility.end() ? true : visible_it->second;
-    if (!local_visible) return false;
-
-    const auto binding_it = scene.layerParentBindings.find(layer_id);
-    if (binding_it == scene.layerParentBindings.end() || binding_it->second.parent_id == 0) {
-        return true;
-    }
-
-    return IsLayerVisibleImpl(scene, binding_it->second.parent_id, visiting);
+    return true;
 }
 
 Eigen::Vector3d ToVector3d(const std::array<float, 3>& value) {
@@ -160,8 +150,7 @@ void CollectLayerEffectNodes(const Scene& scene, int32_t layer_id, std::vector<S
 void ApplyLayerVisibilityRecursive(Scene& scene, int32_t layer_id, std::unordered_set<int32_t>& visited) {
     if (layer_id == 0 || !visited.insert(layer_id).second) return;
 
-    std::unordered_set<int32_t> visiting;
-    const bool effective_visible = IsLayerVisibleImpl(scene, layer_id, visiting);
+    const bool effective_visible = IsLayerVisibleImpl(scene, layer_id);
 
     if (auto runtime_nodes_it = scene.objectRuntimeNodes.find(layer_id);
         runtime_nodes_it != scene.objectRuntimeNodes.end()) {
@@ -186,9 +175,11 @@ void ApplyLayerVisibilityRecursive(Scene& scene, int32_t layer_id, std::unordere
         }
     }
 
-    for (const auto& [child_id, binding] : scene.layerParentBindings) {
-        if (binding.parent_id == layer_id) {
-            ApplyLayerVisibilityRecursive(scene, child_id, visited);
+    // Child layers are the SceneObject children; the object tree is the only
+    // parent/child source.
+    if (const auto* object = scene.FindSceneObject(layer_id)) {
+        for (const auto* child : object->children()) {
+            if (child != nullptr) ApplyLayerVisibilityRecursive(scene, child->id(), visited);
         }
     }
 }
@@ -754,18 +745,19 @@ void Scene::BindSceneObjectParent(int32_t layer_id, int32_t parent_id,
 void Scene::SetLayerLocalVisibility(int32_t layer_id, bool visible) {
     if (layer_id == 0) return;
 
-    layerLocalVisibility[layer_id] = visible;
-    if (auto* object = FindSceneObject(layer_id)) object->set_local_visible(visible);
+    // The SceneObject is the only owner of layer visibility. Scripts can set
+    // visibility on a layer before its runtime nodes materialize, so create
+    // the object when it does not exist yet.
+    EnsureSceneObject(layer_id).set_local_visible(visible);
 }
 
 bool Scene::GetLayerLocalVisibility(int32_t layer_id) const {
-    auto it = layerLocalVisibility.find(layer_id);
-    return it == layerLocalVisibility.end() ? true : it->second;
+    const auto* object = FindSceneObject(layer_id);
+    return object == nullptr ? true : object->local_visible();
 }
 
 bool Scene::IsLayerVisible(int32_t layer_id) const {
-    std::unordered_set<int32_t> visiting;
-    return IsLayerVisibleImpl(*this, layer_id, visiting);
+    return IsLayerVisibleImpl(*this, layer_id);
 }
 
 void Scene::ApplyLayerVisibility(int32_t layer_id) {
