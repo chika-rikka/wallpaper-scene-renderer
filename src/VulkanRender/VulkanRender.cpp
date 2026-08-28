@@ -891,25 +891,25 @@ void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
     auto update_pass = [](VulkanPass* pass) {
         if (pass != nullptr && pass->prepared()) pass->updateBeforeUpload();
     };
+    // ShaderDrawCore::refreshResources returns false (and
+    // CustomShaderPass unprepares) when a static dest card is
+    // Dirty after TEXT_2F0 AABB growth. Official vt+0xb8 still
+    // Draws this dest-draw; prepare() is the TREE recreate.
+    auto refresh_named = [this, &object, &rr](VulkanPass* pass) {
+        if (pass == nullptr || object.scene() == nullptr) return;
+        if (pass->prepared()) {
+            pass->refreshResources(*object.scene(), *m_device, rr);
+        }
+        if (!pass->prepared()) {
+            pass->prepare(*object.scene(), *m_device, rr);
+        }
+    };
     if (object.kind() == SceneObjectKind::Text && object.effect_count() > 0 &&
         object.scene() != nullptr) {
         // TEXT_2F0 0x140258a02 vt+0xb8 recreates leftover +0x2c8 / FullCompo
         // immediately before leftover Draw. Runtime dest_size can grow past
         // parse JSON+pad (live Date +0x2f0=1412). Refresh leftover TextPass
         // and HORIZONTAL so both Query the same AABB key this DestDraw.
-        auto refresh_named = [this, &object, &rr](VulkanPass* pass) {
-            if (pass == nullptr) return;
-            // ShaderDrawCore::refreshResources returns false (and
-            // CustomShaderPass unprepares) when a static dest card is
-            // Dirty after TEXT_2F0 AABB growth. Official vt+0xb8 still
-            // Draws this dest-draw; prepare() is the TREE recreate.
-            if (pass->prepared()) {
-                pass->refreshResources(*object.scene(), *m_device, rr);
-            }
-            if (!pass->prepared()) {
-                pass->prepare(*object.scene(), *m_device, rr);
-            }
-        };
         if (leftover_it != m_dest_leftover.end()) {
             for (auto* pass : leftover_it->second) refresh_named(pass);
         }
@@ -949,12 +949,26 @@ void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
                 node->Mesh()->ChangeMeshDataFrom(*object.leftover_mesh());
                 node->Mesh()->SetDirty();
             }
-            if (pass->prepared()) {
-                pass->refreshResources(*object.scene(), *m_device, rr);
-            }
-            if (!pass->prepared()) {
-                pass->prepare(*object.scene(), *m_device, rr);
-            }
+            refresh_named(pass);
+        }
+        // PPONG_REBIND: the leftover re-prepare above re-Queries the chain
+        // ping-pong RT by name. The previous frame's final reader already
+        // MarkShareReady()d that name (its m_query_map entry is gone), so
+        // the re-Query may attach the name to a different share-ready
+        // physical image. POSTFX / leftover-MVP / last-pass bound their
+        // sampled views at graph compile; without the same per-frame
+        // re-Query they keep sampling the retired image — the head froze
+        // on its first-frame card and the sleeve+lantern chain vanished
+        // once another layer claimed its old image. TEXT dest-draw above
+        // already refreshes every phase per Record; mirror it for IMAGE.
+        if (postfx_it != m_dest_postfx.end()) {
+            for (auto* pass : postfx_it->second) refresh_named(pass);
+        }
+        if (leftover_mvp_it != m_dest_leftover_mvp.end()) {
+            refresh_named(leftover_mvp_it->second);
+        }
+        if (last_it != m_dest_lastpass.end()) {
+            refresh_named(last_it->second);
         }
     }
     if (leftover_it != m_dest_leftover.end()) {
