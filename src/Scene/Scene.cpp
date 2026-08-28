@@ -662,38 +662,40 @@ Scene::EffectiveImportedTextureResolution(const SceneTexture& texture) const {
 void Scene::SetLayerParentBinding(int32_t layer_id, int32_t parent_id, std::string attachment) {
     if (layer_id == 0) return;
     if (parent_id == 0 && attachment.empty()) {
-        layerParentBindings.erase(layer_id);
-        if (auto* object = FindSceneObject(layer_id)) object->set_parent(nullptr, -1);
+        ClearLayerParentBinding(layer_id);
         return;
     }
-    layerParentBindings[layer_id] = LayerParentBinding {
-        .parent_id = parent_id,
-        .attachment = std::move(attachment),
-    };
-    BindSceneObjectParent(layer_id, parent_id, layerParentBindings[layer_id].attachment);
+    // The SceneObject parent pointer plus the authored attachment name is the
+    // only parent-binding storage. Scripts can bind layers whose objects have
+    // not materialized yet, so create both endpoints on demand.
+    EnsureSceneObject(layer_id);
+    if (parent_id != 0) EnsureSceneObject(parent_id);
+    BindSceneObjectParent(layer_id, parent_id, attachment);
 }
 
 Scene::LayerParentBinding Scene::GetLayerParentBinding(int32_t layer_id) const {
-    auto it = layerParentBindings.find(layer_id);
-    return it == layerParentBindings.end() ? LayerParentBinding {} : it->second;
+    const auto* object = FindSceneObject(layer_id);
+    if (object == nullptr) return LayerParentBinding {};
+    return LayerParentBinding {
+        .parent_id  = object->parent() != nullptr ? object->parent()->id() : 0,
+        .attachment = object->attachment(),
+    };
 }
 
 void Scene::ClearLayerParentBinding(int32_t layer_id) {
-    layerParentBindings.erase(layer_id);
+    if (auto* object = FindSceneObject(layer_id)) {
+        object->set_parent(nullptr, -1);
+        object->set_attachment({});
+    }
 }
 
 std::vector<int32_t> Scene::GetLayerChildren(int32_t layer_id) const {
+    std::vector<int32_t> children;
     if (const auto* object = FindSceneObject(layer_id); object != nullptr) {
-        std::vector<int32_t> children;
         children.reserve(object->children().size());
         for (auto* child : object->children()) {
             if (child != nullptr) children.push_back(child->id());
         }
-        if (! children.empty()) return children;
-    }
-    std::vector<int32_t> children;
-    for (const auto& [child_id, binding] : layerParentBindings) {
-        if (binding.parent_id == layer_id) children.push_back(child_id);
     }
     return children;
 }
@@ -739,6 +741,7 @@ void Scene::BindSceneObjectParent(int32_t layer_id, int32_t parent_id,
     auto* parent = parent_id != 0 ? FindSceneObject(parent_id) : nullptr;
     // 0x1401de931 / 0x14018802c: +0x180 parent*, +0x190 attach index or -1,
     // r8 adjustTransforms=0 so 0x1401de928 skips attach-zero 0x1401de962.
+    child->set_attachment(std::string(attachment));
     child->set_parent(parent, attachment.empty() ? -1 : 0);
 }
 

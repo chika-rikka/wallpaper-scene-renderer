@@ -108,6 +108,11 @@ public:
     int32_t      attach_index() const { return m_attach_index; }
     void         set_parent(SceneObject* parent, int32_t attach_index);
     const std::vector<SceneObject*>& children() const { return m_children; }
+    // Authored bone-attachment name (scene.json "attachment"). The resolved
+    // bone index lives in attach_bone_index(); this keeps the authored string
+    // so scripts can round-trip it.
+    const std::string& attachment() const { return m_attachment; }
+    void               set_attachment(std::string name) { m_attachment = std::move(name); }
 
     SceneObject*       Root();
     const SceneObject* Root() const;
@@ -209,6 +214,7 @@ private:
     Eigen::Vector2f m_leftover_parallax { 0.0f, 0.0f };
     SceneObject*    m_parent { nullptr };
     int32_t         m_attach_index { -1 };
+    std::string     m_attachment;
     uint32_t        m_attach_bone { 0xFFFFFFFFu };
     Eigen::Affine3f m_attach_bind { Eigen::Affine3f::Identity() };
     std::vector<SceneObject*> m_children;
