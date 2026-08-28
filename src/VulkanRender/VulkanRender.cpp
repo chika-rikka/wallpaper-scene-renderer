@@ -53,7 +53,7 @@ using namespace wallpaper::vulkan;
 using wallpaper::DestDrawGfx;
 using wallpaper::DestDrawPhase;
 
-constexpr uint64_t vk_wait_time { 10u * 1000u * 1000000u };
+constexpr uint64_t vk_wait_time { 300u * 1000u * 1000000u };
 constexpr uint32_t vk_command_num { 1 };
 constexpr std::size_t kDeferredPrepareMaxPassesPerFrame { 96 };
 constexpr double      kDeferredPrepareFrameBudgetMs { 2.0 };
@@ -67,9 +67,9 @@ constexpr std::array base_device_exts {
     Extension { false, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME },
     Extension { true, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME },
     Extension { true, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME },
-    Extension { true, VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME },
+    Extension { false, VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME },
     Extension { true, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME },
-    Extension { true, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME }
+    Extension { false, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME }
 };
 
 namespace
