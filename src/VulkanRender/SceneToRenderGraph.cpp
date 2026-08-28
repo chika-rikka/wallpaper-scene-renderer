@@ -297,11 +297,13 @@ static void ApplyDestDrawLeftover(Scene& scene, SceneNode* node, i32 imgId,
     options.use_active_camera_for_parallax = false;
     if (object->effect_count() <= 0) {
         // IMAGE_VT_F0 leftover +0x320==0 Draw [+0x490]. Puppet leftover-card
-        // writes puppet+0x18 verts (PUPPET_490). No-puppet IMAGE_490_MESH
-        // ±half dest. Live +0x110 id 0xd uploads +0x8f0 (LastPassDrawMvp).
-        const SceneMesh* leftover_f0 = object->image_490_mesh() != nullptr
-                                           ? object->image_490_mesh()
-                                           : object->lastpass_mesh();
+        // writes puppet+0x18 verts (PUPPET_490). No-puppet +0x490 is the
+        // MESH_FACTORY card already bound on the node: it carries the
+        // authored UV contract (sprite frames stay frame-local [0,1],
+        // nopadding samples the full texture). The +0x2e8 last-pass card
+        // uses leftover UV (content/physical) and must not replace it.
+        // Live +0x110 id 0xd uploads +0x8f0 (LastPassDrawMvp).
+        const SceneMesh* leftover_f0 = object->image_490_mesh();
         if (leftover_f0 != nullptr && node != nullptr && node->Mesh() != nullptr) {
             node->Mesh()->ChangeMeshDataFrom(*leftover_f0);
             node->Mesh()->SetDirty();

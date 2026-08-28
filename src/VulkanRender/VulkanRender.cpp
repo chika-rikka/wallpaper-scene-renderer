@@ -142,12 +142,6 @@ struct VulkanRender::Impl : wallpaper::DestDrawGfx {
     void Record(wallpaper::SceneObject& object) override;
     void ClearDestDrawPasses();
     void IndexDestDrawPass(VulkanPass* pass);
-    void PrepareDestDrawPasses(Scene&);
-    void RefreshDestDrawPasses(Scene&, bool refresh_all,
-                               const std::unordered_set<std::string>& dirty_render_targets,
-                               const std::unordered_set<std::string>& dirty_imported_textures,
-                               const std::unordered_set<int32_t>& dirty_text_layers);
-    void DestroyDestDrawPasses();
 
     bool init(RenderInitInfo);
     void destroy();
@@ -218,7 +212,6 @@ struct VulkanRender::Impl : wallpaper::DestDrawGfx {
     std::unordered_map<int32_t, VulkanPass*> m_dest_leftover_mvp;
     std::unordered_map<int32_t, std::vector<VulkanPass*>> m_dest_postfx;
     std::unordered_map<int32_t, VulkanPass*> m_dest_lastpass;
-    std::vector<VulkanPass*> m_dest_draw_all;
     std::unordered_set<int32_t> m_dest_draw_contracts_logged;
 
 };
@@ -523,7 +516,9 @@ void VulkanRender::Impl::destroy() {
         }
 
         // res
-        DestroyDestDrawPasses();
+        // Dest-draw passes live in m_passes; the loop below destroys them
+        // once. Only the phase index needs clearing.
+        ClearDestDrawPasses();
         for (auto& p : m_passes) {
             p->destory(*m_device, m_rendering_resources);
         }
@@ -796,7 +791,6 @@ void VulkanRender::Impl::ClearDestDrawPasses() {
     m_dest_leftover_mvp.clear();
     m_dest_postfx.clear();
     m_dest_lastpass.clear();
-    m_dest_draw_all.clear();
 }
 
 void VulkanRender::Impl::IndexDestDrawPass(VulkanPass* pass) {
@@ -804,7 +798,6 @@ void VulkanRender::Impl::IndexDestDrawPass(VulkanPass* pass) {
     const DestDrawPhase phase = pass->destDrawPhase();
     if (phase == DestDrawPhase::None) return;
     const int32_t layer_id = pass->destDrawLayerId();
-    m_dest_draw_all.push_back(pass);
     if (phase == DestDrawPhase::Leftover) {
         m_dest_leftover[layer_id].push_back(pass);
         return;
@@ -818,51 +811,6 @@ void VulkanRender::Impl::IndexDestDrawPass(VulkanPass* pass) {
         return;
     }
     m_dest_lastpass[layer_id] = pass;
-}
-
-void VulkanRender::Impl::PrepareDestDrawPasses(Scene& scene) {
-    for (auto* pass : m_dest_draw_all) {
-        if (pass == nullptr) continue;
-        if (pass->prepared()) {
-            pass->refreshResources(scene, *m_device, m_rendering_resources);
-            continue;
-        }
-        pass->prepare(scene, *m_device, m_rendering_resources);
-    }
-}
-
-void VulkanRender::Impl::RefreshDestDrawPasses(
-    Scene& scene, bool refresh_all,
-    const std::unordered_set<std::string>& dirty_render_targets,
-    const std::unordered_set<std::string>& dirty_imported_textures,
-    const std::unordered_set<int32_t>& dirty_text_layers) {
-    for (auto* pass : m_dest_draw_all) {
-        if (pass == nullptr) continue;
-        const bool broader_resource_refresh =
-            refresh_all || pass->referencesAnyRenderTarget(dirty_render_targets) ||
-            pass->referencesAnyTextLayer(dirty_text_layers);
-        const bool imported_binding_refresh =
-            pass->referencesAnyImportedTexture(dirty_imported_textures);
-        if (!broader_resource_refresh && !imported_binding_refresh) continue;
-        if (pass->prepared()) {
-            if (broader_resource_refresh) {
-                pass->refreshResources(scene, *m_device, m_rendering_resources);
-            } else {
-                pass->refreshImportedTextureBindings(scene, *m_device);
-            }
-        }
-        if (!pass->prepared()) {
-            pass->prepare(scene, *m_device, m_rendering_resources);
-        }
-    }
-}
-
-void VulkanRender::Impl::DestroyDestDrawPasses() {
-    std::unordered_set<VulkanPass*> destroyed;
-    for (auto* pass : m_dest_draw_all) {
-        DestroyPassOnce(pass, *m_device, m_rendering_resources, destroyed);
-    }
-    ClearDestDrawPasses();
 }
 
 void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
@@ -983,14 +931,18 @@ void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
         }
         if (last_it != m_dest_lastpass.end()) refresh_named(last_it->second);
     }
-    if (object.kind() == SceneObjectKind::Image && object.scene() != nullptr &&
-        object.leftover_mesh() != nullptr && leftover_it != m_dest_leftover.end()) {
+    if (object.kind() == SceneObjectKind::Image && object.effect_count() > 0 &&
+        object.scene() != nullptr && object.leftover_mesh() != nullptr &&
+        leftover_it != m_dest_leftover.end()) {
         // IMAGE_2D8_NOFULLFB 0x1401eb180 / IMAGE_VT_E8 0x140208067:
         // leftover Draw +0x2d8 is flags=0 0..AABB, not last-pass
         // +0x2e8 ±half. Owner image Mesh() stays Dynamic() after
         // ChangeMeshDataFrom; rebind the live leftover card before
         // dest-ortho flush so IMAGE leftover is not a puppet/±half
-        // card under dest-ortho (0,W,0,H).
+        // card under dest-ortho (0,W,0,H). Only the +0x320>0 dest-ortho
+        // leftover Draws +0x2d8. IMAGE_VT_F0 (+0x320==0) Draws [+0x490]
+        // ±half under LastPassDrawMvp; forcing the 0..AABB card there
+        // shifted every plain image by +half its dest size.
         for (auto* pass : leftover_it->second) {
             if (auto* node = pass->destDrawNode();
                 node != nullptr && node->Mesh() != nullptr) {
@@ -1100,38 +1052,15 @@ void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
             }
         }
     }
-    if (m_vertex_buf) m_vertex_buf->recordUpload(rr.command);
-    if (m_dyn_buf) m_dyn_buf->recordUpload(rr.command);
-    rr.immutable_meshes.recordUploads(rr.command);
-    // IMAGE_VT_E8 0x140207c74 leftover Draw +0x2d8 after flush of
-    // [+0x4a0]/[+0x498]. Official layer albedo is already a D3D11 SRV.
-    // TEXT_E0_IDEST 0x1401e9681 OMSet leftover named-RT then 0x1401e968a
-    // TEXT_E0 samples FullFB. TEXT_E8 leftover glyphs follow. Official
-    // leftover RT, FullFB, and glyph atlas exist at that Draw. TREE
-    // Query during refresh queues UNDEFINED RTs and imported image
-    // uploads; dest-draw runs in the compose walker before the later
-    // frame RecordUploads. Flush both now so leftover IMAGE / TEXT_E0
-    // sample a shader-readable resource, not an unuploaded image.
-    // Bootstrap RT clear is still not official leftover content —
-    // official first write is composelayer_clearalpha / IMAGE leftover
-    // Draw.
-    m_device->tex_cache().RecordUploads(rr.command);
-    m_device->video_tex_cache().RecordUploads(rr.command);
-    auto execute_pass = [this, &rr](VulkanPass* pass) {
-        if (pass != nullptr && pass->prepared()) pass->execute(*m_device, rr);
-    };
-    if (leftover_it != m_dest_leftover.end()) {
-        for (auto* pass : leftover_it->second) execute_pass(pass);
-    }
-    if (postfx_it != m_dest_postfx.end()) {
-        for (auto* pass : postfx_it->second) execute_pass(pass);
-    }
-    if (leftover_mvp != nullptr && leftover_mvp->prepared()) {
-        // IMAGE_VT_F8_PUPPET leftover-MVP node Mesh() is +0x490 at prepare
-        // (PUPPET_490). Do not swap leftover dest-ortho +0x2d8 after upload.
-        execute_pass(leftover_mvp);
-    }
-    execute_pass(last);
+    // LEFTOVER_VS_DESTDRAW: the walker only WRITES this object's dest-draw
+    // state (live meshes, named-RT sizes, +0x930/+0x8f0 MVPs) while the
+    // dest-STACK is live. Execution stays in the compiled render-graph
+    // order, which is the official object-walker order and interleaves
+    // leftover → POSTFX → leftover-MVP → last-pass with particle / shape /
+    // model / compose-source passes that never became dest-draw phases.
+    // The frame loop records staging and TextureCache uploads after the
+    // whole walker, so every refresh/prepare issued here is uploaded
+    // before the first pass executes.
 }
 
 void VulkanRender::Impl::drawFrameSwapchain() {
@@ -1168,12 +1097,14 @@ void VulkanRender::Impl::drawFrameSwapchain() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     }), "begin swapchain frame command buffer"))
         return;
-    // Official last-pass writes leftover FullFB after the frame clear
-    // (POSTFX_OMSET / LEFTOVER_VS_DESTDRAW). PrePass must run first;
-    // executing it after DestDraw wipes Default.
-    if (m_prepass != nullptr && m_prepass->prepared()) {
-        m_prepass->execute(*m_device, rr);
-    }
+    // FRAME_DEST_NO_RESET 0x14018aac0 / PATH_B 0x14018b170: the compose
+    // walker WRITES each object's dest-draw state (live meshes, named-RT
+    // refresh, +0x930/+0x8f0 MVPs) while its dest-STACK is live, before
+    // the staging uploads below record. Passes execute exactly once, in
+    // compiled graph order: PrePass clears Default first, then leftover →
+    // POSTFX → leftover-MVP → last-pass interleave with particle / shape /
+    // model passes like the official object walker (no second 0x1401ebf60
+    // DONT_CARE re-draw to discard leftover / FullCompo).
     if (rr.scene != nullptr) RunComposeDrawWalker(*rr.scene, this);
     // Deferred pass preparation can allocate and write static vertex/index subranges between
     // frames. Recording the static upload here keeps those newly resident passes drawable without
@@ -1185,13 +1116,6 @@ void VulkanRender::Impl::drawFrameSwapchain() {
     m_device->tex_cache().RecordUploads(rr.command);
     m_device->video_tex_cache().RecordUploads(rr.command);
     for (auto* p : m_passes) {
-        if (p == m_prepass.get()) continue;
-        // LEFTOVER_VS_DESTDRAW 0x1401e8ed9 / 0x1401ea151: leftover then
-        // POSTFX then last-pass are one dest-draw. A second DONT_CARE
-        // HORIZONTAL / IMAGE leftover in m_passes discards that write
-        // (FullCompo / leftover named-RT go uninit white). Official
-        // walker does not run 0x1401ebf60 again after DEST_DRAW_JOIN.
-        if (p->destDrawPhase() != DestDrawPhase::None) continue;
         if (p->prepared()) {
             p->execute(*m_device, rr);
         }
@@ -1285,12 +1209,14 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     }), "begin offscreen frame command buffer"))
         return;
-    // Official last-pass writes leftover FullFB after the frame clear
-    // (POSTFX_OMSET / LEFTOVER_VS_DESTDRAW). Offscreen capture uses
-    // this path; PrePass after DestDraw wipes 3363252053's Default.
-    if (m_prepass != nullptr && m_prepass->prepared()) {
-        m_prepass->execute(*m_device, rr);
-    }
+    // FRAME_DEST_NO_RESET 0x14018aac0 / PATH_B 0x14018b170: the compose
+    // walker WRITES each object's dest-draw state (live meshes, named-RT
+    // refresh, +0x930/+0x8f0 MVPs) while its dest-STACK is live, before
+    // the staging uploads below record. Passes execute exactly once, in
+    // compiled graph order: PrePass clears Default first, then leftover →
+    // POSTFX → leftover-MVP → last-pass interleave with particle / shape /
+    // model passes like the official object walker (no second 0x1401ebf60
+    // DONT_CARE re-draw to discard leftover / FullCompo).
     RunComposeDrawWalker(scene, this);
     m_vertex_buf->recordUpload(rr.command);
     m_dyn_buf->recordUpload(rr.command);
@@ -1299,14 +1225,7 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     m_device->video_tex_cache().RecordUploads(rr.command);
 
     for (auto* p : m_passes) {
-        if (p == m_prepass.get()) continue;
         if (! p->prepared()) continue;
-        // LEFTOVER_VS_DESTDRAW 0x1401e8ed9 / 0x1401ea151: dest-draw
-        // already ran in the compose walker. Re-executing DONT_CARE
-        // HORIZONTAL / IMAGE leftover here discards FullCompo / leftover
-        // (SceneToRenderGraph dest-draw copies in m_passes feed empty
-        // FullCompo). Official join has no second 0x1401ebf60.
-        if (p->destDrawPhase() != DestDrawPhase::None) continue;
         p->execute(*m_device, rr);
     }
 
@@ -1532,7 +1451,9 @@ void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
     // A topology rebuild invalidates the compiled pass list and the backing mesh buffers that were
     // uploaded for the previous graph. Reallocating those buffers keeps the full rebuild path
     // conservative and mirrors the historical behavior used when nodes were added or removed.
-    DestroyDestDrawPasses();
+    // Dest-draw passes live in m_passes; the loop destroys them once and the
+    // stale phase index is cleared alongside.
+    ClearDestDrawPasses();
     for (auto& p : m_passes) {
         p->destory(*m_device, m_rendering_resources);
     }
@@ -1673,8 +1594,6 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
             !dirty_text_layers.empty();
         const bool refresh_all =
             scene.renderGraphAllResourcesDirty || !has_targeted_dirty_resources;
-        RefreshDestDrawPasses(scene, refresh_all, dirty_render_targets, dirty_imported_textures,
-                              dirty_text_layers);
         std::size_t refreshed_passes = 0;
         std::size_t prepared_passes = 0;
 
@@ -1791,11 +1710,17 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
         for (auto& tex : node_release_texs[index]) {
             vpass->addReleaseTexs(spanone<const std::string_view> { tex->key() });
         }
+        // LEFTOVER_VS_DESTDRAW: dest-draw passes stay in m_passes so each
+        // executes exactly once, in compiled graph order — leftover →
+        // POSTFX → leftover-MVP → last-pass interleaved with particle /
+        // shape / model / compose-source passes, the official object-walker
+        // order. The phase index only routes ComposeDrawWalker state writes
+        // (live meshes, named-RT refresh, +0x930/+0x8f0 MVPs) to the right
+        // pass objects while the dest-STACK is live.
         if (vpass->destDrawPhase() != DestDrawPhase::None) {
             IndexDestDrawPass(vpass);
-        } else {
-            graph_passes.push_back(vpass);
         }
+        graph_passes.push_back(vpass);
         next_compiled_pass_refs.push_back(std::move(pass_ref));
     }
     m_passes = std::move(graph_passes);
@@ -1821,21 +1746,6 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     m_passes.insert(m_passes.begin(), m_prepass.get());
     m_passes.push_back(m_finpass.get());
 
-    // Dest-draw moved a large share of the compiled graph out of m_passes and into the
-    // ComposeDrawWalker. Whatever stays behind still runs after the whole walker, so the two
-    // lists together describe the frame's real submission order. Report the residue by identity
-    // instead of by layer so a mis-partitioned pass is attributable without per-project logging.
-    for (std::size_t residue_index = 0; residue_index < m_passes.size(); ++residue_index) {
-        const auto* residue_pass = m_passes[residue_index];
-        if (residue_pass == nullptr) continue;
-        const auto residue_key = residue_pass->residencyKey();
-        LOG_INFO("RenderGraphPassResidue: index=%zu key='%s' phase=%d layer=%d",
-                 residue_index,
-                 residue_key.empty() ? "(anonymous)" : residue_key.c_str(),
-                 static_cast<int>(residue_pass->destDrawPhase()),
-                 residue_pass->destDrawLayerId());
-    }
-
     setRenderTargetSize(scene, rg);
 
     std::size_t reused_refreshed_count = 0;
@@ -1858,7 +1768,6 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
         p->prepare(scene, *m_device, m_rendering_resources);
         dependency_prepared_count++;
     }
-    PrepareDestDrawPasses(scene);
     for (size_t pass_index = 0; pass_index < m_passes.size(); ++pass_index) {
         auto* p = m_passes[pass_index];
         if (p != nullptr && reused_passes.count(p) != 0 && p->prepared()) {
