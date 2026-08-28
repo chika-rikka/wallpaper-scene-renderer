@@ -1,7 +1,9 @@
 #include "TextPass.hpp"
 
 #include "Scene/Scene.h"
+#include "Scene/SceneMesh.h"
 #include "Scene/SceneNode.h"
+#include "Scene/SceneObject.h"
 #include "Scene/SceneTextPrimitive.h"
 #include "SpecTexs.hpp"
 #include "Utils/Logging.h"
@@ -23,7 +25,15 @@ namespace
 {
 constexpr std::string_view kTextBackgroundTextureKey { "__text_layer_background_white" };
 
-std::string TextPipelineCompatibilityKey(bool offscreen_output,
+bool LeftoverNamedDestDraw(const TextPass::Desc& desc) {
+    // TEXT_CLEARALPHA / TEXT_E0_IDEST: Date +0x320>0 leftover OMSet is
+    // the AABB named-RT, not FullFB. Clock +0x320==0 leftover is FullFB
+    // and does not take this arm.
+    return desc.dest_draw_phase == wallpaper::DestDrawPhase::Leftover &&
+           desc.output != wallpaper::SpecTex_Default;
+}
+
+std::string TextPipelineCompatibilityKey(VkAttachmentLoadOp load_op,
                                          wallpaper::BlendMode blend_mode,
                                          wallpaper::AlphaWritePolicy alpha_write_policy,
                                          VkSampleCountFlagBits sample_count,
@@ -31,9 +41,8 @@ std::string TextPipelineCompatibilityKey(bool offscreen_output,
     // Text PSOs are shared by render-pass compatibility plus the full GraphicsPipeline descriptor,
     // not by the layer that first requested them. This keeps visibility toggles on the same model
     // as engine-level PSO caches while still letting hidden text release atlas/framebuffer memory.
-    return "TextPass|format=rgba8|final=shader-read|load=" +
-           std::to_string(static_cast<int>(offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                                                            : VK_ATTACHMENT_LOAD_OP_LOAD)) +
+    return "TextPass|format=rgba8|final=shader-read|store-vis=1|load=" +
+           std::to_string(static_cast<int>(load_op)) +
            "|blend=" + std::to_string(static_cast<int>(blend_mode)) +
            "|alpha-policy=" + std::to_string(static_cast<int>(alpha_write_policy)) +
            "|samples=" + std::to_string(static_cast<int>(sample_count)) +
@@ -64,22 +73,11 @@ struct TextVertexInputLayout {
     std::array<VkVertexInputAttributeDescription, 2> attributes {};
 };
 
-std::optional<TextVertexInputLayout> ResolveTextVertexInputLayout(
-    const wallpaper::SceneTextPrimitive& primitive) {
-    const wallpaper::SceneMesh* source_mesh { nullptr };
-    for (const auto& page : primitive.glyph_pages) {
-        if (page.mesh != nullptr && page.mesh->VertexCount() > 0) {
-            source_mesh = page.mesh.get();
-            break;
-        }
-    }
-    if (source_mesh == nullptr && primitive.background_mesh != nullptr &&
-        primitive.background_mesh->VertexCount() > 0) {
-        source_mesh = primitive.background_mesh.get();
-    }
-    if (source_mesh == nullptr || source_mesh->VertexCount() == 0) return std::nullopt;
+std::optional<TextVertexInputLayout> ResolveMeshVertexInputLayout(
+    const wallpaper::SceneMesh& source_mesh) {
+    if (source_mesh.VertexCount() == 0) return std::nullopt;
 
-    const auto& vertex = source_mesh->GetVertexArray(0);
+    const auto& vertex = source_mesh.GetVertexArray(0);
     const auto  attrs = vertex.GetAttrOffsetMap();
     const auto  position_it = attrs.find(std::string(wallpaper::WE_IN_POSITION));
     const auto  texcoord_it = attrs.find(std::string(wallpaper::WE_IN_TEXCOORD));
@@ -114,6 +112,23 @@ std::optional<TextVertexInputLayout> ResolveTextVertexInputLayout(
         },
     };
     return layout;
+}
+
+std::optional<TextVertexInputLayout> ResolveTextVertexInputLayout(
+    const wallpaper::SceneTextPrimitive& primitive) {
+    const wallpaper::SceneMesh* source_mesh { nullptr };
+    for (const auto& page : primitive.glyph_pages) {
+        if (page.mesh != nullptr && page.mesh->VertexCount() > 0) {
+            source_mesh = page.mesh.get();
+            break;
+        }
+    }
+    if (source_mesh == nullptr && primitive.background_mesh != nullptr &&
+        primitive.background_mesh->VertexCount() > 0) {
+        source_mesh = primitive.background_mesh.get();
+    }
+    if (source_mesh == nullptr) return std::nullopt;
+    return ResolveMeshVertexInputLayout(*source_mesh);
 }
 
 std::optional<PreparedTextShaders> CompileTextShaders() {
@@ -191,6 +206,86 @@ float4 main_ps(PSInput input) : SV_Target0 {
     return prepared;
 }
 
+std::optional<PreparedTextShaders> CompileClearalphaShaders() {
+    // TEXT_CLEARALPHA official composelayer.vert/frag + CLEARALPHA=1.
+    // gl_Position from a_TexCoord*2-1 (named-RT NDC). g_MVP only for
+    // v_ScreenCoord FullFB sample. Not font.vert.
+    static const char* kVertexSource = R"(
+[[vk::binding(0, 0)]] cbuffer TextUniformBlock {
+    column_major float4x4 g_ModelViewProjectionMatrix;
+    float4 g_Color4;
+};
+
+struct VSInput {
+    [[vk::location(0)]] float3 a_Position : A_POSITION;
+    [[vk::location(1)]] float2 a_TexCoord : A_TEXCOORD;
+};
+
+struct VSOutput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float2 v_TexCoord : TEXCOORD0;
+    [[vk::location(1)]] float3 v_ScreenCoord : TEXCOORD1;
+};
+
+VSOutput main_vs(VSInput input) {
+    VSOutput output;
+    float4 clip = mul(g_ModelViewProjectionMatrix, float4(input.a_Position, 1.0));
+    output.v_ScreenCoord = float3(clip.x, -clip.y, clip.w);
+    float2 ndc = float2(input.a_TexCoord.x, 1.0 - input.a_TexCoord.y) * 2.0 - 1.0;
+    output.position = float4(ndc, 0.0, 1.0);
+    output.v_TexCoord = input.a_TexCoord;
+    return output;
+}
+)";
+
+    static const char* kFragmentSource = R"(
+[[vk::combinedImageSampler]][[vk::binding(1, 0)]] Texture2D<float4> g_Texture0;
+[[vk::combinedImageSampler]][[vk::binding(1, 0)]] SamplerState g_Texture0_ww_sampler;
+
+struct PSInput {
+    float4 position : SV_Position;
+    [[vk::location(0)]] float2 v_TexCoord : TEXCOORD0;
+    [[vk::location(1)]] float3 v_ScreenCoord : TEXCOORD1;
+};
+
+float4 main_ps(PSInput input) : SV_Target0 {
+    float2 uv = input.v_ScreenCoord.xy / input.v_ScreenCoord.z * 0.5 + 0.5;
+    float4 color = g_Texture0.Sample(g_Texture0_ww_sampler, uv);
+    color.a = 0.0;
+    return color;
+}
+)";
+
+    ShaderCompOpt options {};
+    options.target_env = ShaderTargetEnv::VULKAN_1_0;
+    options.auto_map_locations = false;
+    options.auto_map_bindings = false;
+
+    std::array<ShaderCompUnit, 2> units {
+        ShaderCompUnit {
+            .stage = wallpaper::ShaderType::VERTEX,
+            .source_language = ShaderSourceLanguage::HLSL,
+            .debug_name = "TextPassClearalpha.vert",
+            .entry_point = "main_vs",
+            .src = kVertexSource,
+        },
+        ShaderCompUnit {
+            .stage = wallpaper::ShaderType::FRAGMENT,
+            .source_language = ShaderSourceLanguage::HLSL,
+            .debug_name = "TextPassClearalpha.frag",
+            .entry_point = "main_ps",
+            .src = kFragmentSource,
+        },
+    };
+
+    PreparedTextShaders prepared;
+    if (!CompileAndLinkShaderUnits(units, options, prepared.stages)) {
+        LOG_ERROR("TextPass: failed to compile TEXT_CLEARALPHA composelayer");
+        return std::nullopt;
+    }
+    return prepared;
+}
+
 bool BindTextPassOutput(wallpaper::Scene& scene, const Device& device, TextPass::Desc& desc) {
     desc.sample_count = VK_SAMPLE_COUNT_1_BIT;
     desc.resolve_msaa = false;
@@ -227,6 +322,16 @@ bool BindTextPassOutput(wallpaper::Scene& scene, const Device& device, TextPass:
     if (auto opt = device.tex_cache().Query(desc.output, ToTexKey(rt), ! rt.allowReuse);
         opt.has_value()) {
         desc.vk_output = opt.value();
+        if ((desc.layer_id == 248 || desc.layer_id == 242) &&
+            desc.dest_draw_phase == wallpaper::DestDrawPhase::Leftover) {
+            LOG_INFO("DestDrawLeftoverTextBind: id=%d output='%s' rt=%dx%d query=%ux%u",
+                     desc.layer_id,
+                     desc.output.c_str(),
+                     rt.width,
+                     rt.height,
+                     desc.vk_output.extent.width,
+                     desc.vk_output.extent.height);
+        }
         return true;
     }
     return false;
@@ -266,6 +371,7 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
                                     RenderingResources&                   rr,
                                     const wallpaper::SceneTextPrimitive&  primitive,
                                     bool                                  offscreen_output,
+                                    VkAttachmentLoadOp                    color_load_op,
                                     wallpaper::AlphaWritePolicy           alpha_write_policy,
                                     VkSampleCountFlagBits                 sample_count,
                                     bool                                  resolve_msaa,
@@ -274,7 +380,7 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
     auto render_pass = CreateShaderDrawRenderPass(
         device.handle(),
         VK_FORMAT_R8G8B8A8_UNORM,
-        offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
+        color_load_op,
         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         {},
         sample_count,
@@ -336,7 +442,7 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
         sample_count > VK_SAMPLE_COUNT_1_BIT ? sample_count : VK_SAMPLE_COUNT_1_BIT;
     pipeline_parameters.debug_name = std::move(debug_name);
     pipeline_parameters.cache_key = TextPipelineCompatibilityKey(
-        offscreen_output, blend_mode, alpha_write_policy, sample_count, resolve_msaa);
+        color_load_op, blend_mode, alpha_write_policy, sample_count, resolve_msaa);
     pipeline.addDescriptorSetInfo(std::span<const DescriptorSetInfo>(&descriptor_info, 1))
         .setColorBlendStates(std::span<const VkPipelineColorBlendAttachmentState>(&blend_state, 1))
         .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
@@ -349,6 +455,77 @@ bool CreateTextPipelineForPrimitive(const Device&                         device
     }
 
     return pipeline.create(device, *render_pass, pipeline_parameters, rr.pipeline_cache.get());
+}
+
+bool CreateClearalphaPipeline(const Device&                        device,
+                              const wallpaper::SceneMesh&          card_mesh,
+                              VkSampleCountFlagBits                sample_count,
+                              bool                                 resolve_msaa,
+                              vvk::RenderPass&                     leftover_pass,
+                              PipelineParameters&                  pipeline_parameters) {
+    // TEXT_CLEARALPHA 0x140258a14 / TEXT_E0_IDEST 0x1401e968a: leftover
+    // named-RT OMSet 0x1401e9681 then +0x5b0 card. Same VkRenderPass as
+    // leftover TEXT_E8 glyphs. Vertex layout is the AABB card, not glyphs.
+    (void)resolve_msaa;
+    const auto compiled_shaders = CompileClearalphaShaders();
+    if (!compiled_shaders.has_value()) return false;
+
+    DescriptorSetInfo descriptor_info;
+    descriptor_info.push_descriptor = true;
+    descriptor_info.bindings = {
+        VkDescriptorSetLayoutBinding {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+        VkDescriptorSetLayoutBinding {
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        },
+    };
+
+    // TEXT_CLEARALPHA publishes +0x5b0 ±half AABB, not glyph verts.
+    const auto vertex_layout = ResolveMeshVertexInputLayout(card_mesh);
+    if (!vertex_layout.has_value()) return false;
+
+    VkPipelineColorBlendAttachmentState blend_state {};
+    blend_state.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                 VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    SetBlend(wallpaper::BlendMode::Normal, blend_state);
+
+    GraphicsPipeline pipeline;
+    pipeline.toDefault();
+    pipeline.multisample.rasterizationSamples =
+        sample_count > VK_SAMPLE_COUNT_1_BIT ? sample_count : VK_SAMPLE_COUNT_1_BIT;
+    pipeline_parameters.debug_name = "TextPassClearalpha";
+    pipeline_parameters.cache_key.clear();
+    pipeline.addDescriptorSetInfo(std::span<const DescriptorSetInfo>(&descriptor_info, 1))
+        .setColorBlendStates(std::span<const VkPipelineColorBlendAttachmentState>(&blend_state, 1))
+        .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP)
+        .addInputBindingDescription(
+            std::span<const VkVertexInputBindingDescription>(&vertex_layout->binding, 1))
+        .addInputAttributeDescription(vertex_layout->attributes);
+    for (const auto& stage : compiled_shaders->stages) {
+        if (!stage) continue;
+        pipeline.addStage(Uni_ShaderSpv(new ShaderSpv(*stage)));
+    }
+    return pipeline.create(device, leftover_pass, pipeline_parameters, nullptr, false);
+}
+
+bool BindClearalphaFullfb(wallpaper::Scene& scene, const Device& device, ImageSlotsRef& slots) {
+    // Official composelayer_clearalpha textures[0] is _rt_FullFrameBuffer.
+    const auto name = std::string(wallpaper::SpecTex_Default);
+    const auto it = scene.renderTargets.find(name);
+    if (it == scene.renderTargets.end()) return false;
+    auto opt = device.tex_cache().Query(name, ToTexKey(it->second), !it->second.allowReuse);
+    if (!opt.has_value()) return false;
+    slots.slots.clear();
+    slots.slots.push_back(opt.value());
+    slots.active = 0;
+    return !slots.slots.empty();
 }
 
 std::array<float, 4> ResolveTextColor(const wallpaper::SceneTextPrimitive& primitive,
@@ -379,6 +556,7 @@ TextPass::TextPass(const Desc& desc) {
     m_desc.node                = desc.node;
     m_desc.layer_id            = desc.layer_id;
     m_desc.execute_when_hidden = desc.execute_when_hidden;
+    m_desc.dest_draw_phase     = desc.dest_draw_phase;
     m_desc.output              = desc.output;
     m_desc.alpha_write_policy  = desc.alpha_write_policy;
 }
@@ -411,8 +589,16 @@ void TextPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     m_desc.node                = next->m_desc.node;
     m_desc.layer_id            = next->m_desc.layer_id;
     m_desc.execute_when_hidden = next->m_desc.execute_when_hidden;
+    m_desc.dest_draw_phase     = next->m_desc.dest_draw_phase;
     m_desc.output              = next->m_desc.output;
     m_desc.alpha_write_policy  = next->m_desc.alpha_write_policy;
+}
+
+void TextPass::writeLastPassMvp(const Eigen::Matrix4f& mvp) {
+    // Date leftover DEST_ORTHO_TNF +0x930 is dest-ortho * I. Clock
+    // TEXT_VT_F0 FONT_MVP +0x930 is FitOrtho * dest-STACK (ENGINE_FLUSH).
+    m_dest_ortho_mvp = mvp;
+    m_has_dest_ortho_mvp = true;
 }
 
 bool TextPass::referencesRenderTarget(std::string_view render_target) const {
@@ -567,7 +753,14 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
     if (!BindTextPassOutput(scene, device, m_desc)) return;
 
     const bool offscreen_output = m_desc.output != wallpaper::SpecTex_Default;
-    m_desc.clear_output = offscreen_output;
+    // TEXT_E0_IDEST then TEXT_E8: leftover named-RT glyphs LOAD after
+    // clearalpha. Clock leftover FullFB stays LOAD (offscreen false).
+    const bool leftover_named = LeftoverNamedDestDraw(m_desc);
+    const VkAttachmentLoadOp color_load_op =
+        leftover_named ? VK_ATTACHMENT_LOAD_OP_LOAD
+                       : (offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                           : VK_ATTACHMENT_LOAD_OP_LOAD);
+    m_desc.clear_output = color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR;
     const auto debug_name =
         "TextPass[node=" + (m_desc.node != nullptr ? m_desc.node->Name() : std::string("(null)")) +
         ",output=" + m_desc.output + "]";
@@ -576,6 +769,7 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
             rr,
             *primitive,
             offscreen_output,
+            color_load_op,
             m_desc.alpha_write_policy,
             m_desc.sample_count,
             m_desc.resolve_msaa,
@@ -583,11 +777,44 @@ void TextPass::prepare(Scene& scene, const Device& device, RenderingResources& r
             m_desc.pipeline)) {
         return;
     }
+    m_has_clearalpha = false;
+    m_clearalpha_fullfb = {};
+    if (leftover_named) {
+        auto* dest_object = scene.FindSceneObject(m_desc.layer_id);
+        wallpaper::SceneMesh* card =
+            dest_object != nullptr ? dest_object->lastpass_mesh() : nullptr;
+        if (card == nullptr ||
+            m_desc.pipeline.cached_state == nullptr ||
+            !m_desc.pipeline.cached_state->pass ||
+            !CreateClearalphaPipeline(device, *card, m_desc.sample_count,
+                                      m_desc.resolve_msaa,
+                                      m_desc.pipeline.cached_state->pass,
+                                      m_clearalpha_pipeline)) {
+            LOG_ERROR("TextPass: TEXT_CLEARALPHA pipeline failed node='%s'",
+                      m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>");
+            return;
+        }
+        if (!BindClearalphaFullfb(scene, device, m_clearalpha_fullfb)) {
+            LOG_ERROR("TextPass: TEXT_CLEARALPHA FullFB missing node='%s'",
+                      m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>");
+            return;
+        }
+        m_has_clearalpha = true;
+    }
     if (!recreateFramebuffer(device)) return;
 
     rr.dyn_buf->allocateSubRef(sizeof(TextPassUniforms),
                                m_desc.ubo_buf,
                                device.limits().minUniformBufferOffsetAlignment);
+    if (leftover_named) {
+        // TEXT_E0_IDEST flush and TEXT_E8 glyphs share one OMSet. DestDraw
+        // recordUpload runs before execute, so leftover uniforms must live
+        // in a second slot: clearalpha g_MVP is LastPassMvp (+0x930),
+        // glyphs are dest-ortho (DEST_ORTHO_TNF after TEXT_E0).
+        rr.dyn_buf->allocateSubRef(sizeof(TextPassUniforms),
+                                   m_clearalpha_ubo_buf,
+                                   device.limits().minUniformBufferOffsetAlignment);
+    }
 
     if (primitive->background_mesh != nullptr) {
         m_background_buffers.force_upload = true;
@@ -631,6 +858,11 @@ bool TextPass::warmupPipeline(Scene& scene, const Device& device, RenderingResou
     if (primitive == nullptr) return false;
 
     const bool offscreen_output = m_desc.output != wallpaper::SpecTex_Default;
+    const bool leftover_named = LeftoverNamedDestDraw(m_desc);
+    const VkAttachmentLoadOp color_load_op =
+        leftover_named ? VK_ATTACHMENT_LOAD_OP_LOAD
+                       : (offscreen_output ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                           : VK_ATTACHMENT_LOAD_OP_LOAD);
     const int intended_samples = IntendedTextSampleCount(&scene, m_desc.output);
     const auto sample_count = static_cast<VkSampleCountFlagBits>(intended_samples);
     const bool resolve_msaa = false;
@@ -642,6 +874,7 @@ bool TextPass::warmupPipeline(Scene& scene, const Device& device, RenderingResou
                                           rr,
                                           *primitive,
                                           offscreen_output,
+                                          color_load_op,
                                           m_desc.alpha_write_policy,
                                           sample_count,
                                           resolve_msaa,
@@ -726,14 +959,35 @@ void TextPass::refreshResources(Scene& scene, const Device& device, RenderingRes
             return;
         }
     }
+    if (m_has_clearalpha && !BindClearalphaFullfb(scene, device, m_clearalpha_fullfb)) {
+        LOG_ERROR("TextPassRefresh: TEXT_CLEARALPHA FullFB missing node='%s'",
+                  m_desc.node != nullptr ? m_desc.node->Name().c_str() : "<null>");
+        setPrepared(false);
+    }
 }
 
 void TextPass::execute(const Device& device, RenderingResources& rr) {
     auto* node = m_desc.node;
     auto* primitive = node != nullptr ? node->Text() : nullptr;
-    if (primitive == nullptr) return;
-    if (!m_desc.pipeline.handle || !m_desc.framebuffer) return;
-    if (node != nullptr && !node->Visible() && !m_desc.execute_when_hidden) return;
+    const bool leftover_date =
+        (m_desc.layer_id == 248 || m_desc.layer_id == 242) &&
+        m_desc.dest_draw_phase == DestDrawPhase::Leftover;
+    if (primitive == nullptr) {
+        if (leftover_date) LOG_INFO("DestDrawLeftoverText: id=%d skip=no_primitive", m_desc.layer_id);
+        return;
+    }
+    if (!m_desc.pipeline.handle || !m_desc.framebuffer) {
+        if (leftover_date)
+            LOG_INFO("DestDrawLeftoverText: id=%d skip=unprepared pipe=%d fb=%d",
+                     m_desc.layer_id,
+                     m_desc.pipeline.handle ? 1 : 0,
+                     m_desc.framebuffer ? 1 : 0);
+        return;
+    }
+    if (node != nullptr && !node->Visible() && !m_desc.execute_when_hidden) {
+        if (leftover_date) LOG_INFO("DestDrawLeftoverText: id=%d skip=visible", m_desc.layer_id);
+        return;
+    }
 
     if (primitive->atlas_version != m_loaded_atlas_version ||
         m_desc.page_textures.size() != primitive->glyph_pages.size()) {
@@ -742,26 +996,146 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         // graph rebuild. Refreshing the bound atlas images lazily here keeps the dedicated text
         // pass on the new scene-owned source of truth instead of depending on parser-time texture
         // registration.
-        if (!refreshTextures(device)) return;
+        if (!refreshTextures(device)) {
+            if (leftover_date)
+                LOG_INFO("DestDrawLeftoverText: id=%d skip=refresh_textures", m_desc.layer_id);
+            return;
+        }
     }
 
     if (primitive->background_mesh != nullptr &&
         !ensureMeshBuffers(*primitive->background_mesh, m_background_buffers, rr)) {
         return;
     }
-    if (m_page_buffers.size() != primitive->glyph_pages.size()) {
-        m_page_buffers.resize(primitive->glyph_pages.size());
+    const bool leftover_layout_local =
+        m_desc.dest_draw_phase == DestDrawPhase::Leftover &&
+        !primitive->leftover_glyph_pages.empty();
+    const auto& glyph_pages =
+        leftover_layout_local ? primitive->leftover_glyph_pages : primitive->glyph_pages;
+    if (m_page_buffers.size() != glyph_pages.size()) {
+        m_page_buffers.resize(glyph_pages.size());
         for (auto& buffers : m_page_buffers) buffers.force_upload = true;
     }
-    for (size_t page_index = 0; page_index < primitive->glyph_pages.size(); page_index++) {
-        if (!ensureMeshBuffers(*primitive->glyph_pages[page_index].mesh, m_page_buffers[page_index], rr)) {
+    for (size_t page_index = 0; page_index < glyph_pages.size(); page_index++) {
+        if (glyph_pages[page_index].mesh == nullptr) {
+            if (leftover_date)
+                LOG_INFO("DestDrawLeftoverText: id=%d skip=null_mesh page=%zu",
+                         m_desc.layer_id,
+                         page_index);
             return;
         }
+        if (!ensureMeshBuffers(*glyph_pages[page_index].mesh, m_page_buffers[page_index], rr)) {
+            if (leftover_date)
+                LOG_INFO("DestDrawLeftoverText: id=%d skip=mesh_upload page=%zu",
+                         m_desc.layer_id,
+                         page_index);
+            return;
+        }
+    }
+    wallpaper::SceneObject* dest_object =
+        m_desc.scene != nullptr ? m_desc.scene->FindSceneObject(m_desc.layer_id) : nullptr;
+    wallpaper::SceneMesh* clearalpha_mesh =
+        m_has_clearalpha && dest_object != nullptr ? dest_object->lastpass_mesh() : nullptr;
+    if (clearalpha_mesh != nullptr &&
+        !ensureMeshBuffers(*clearalpha_mesh, m_clearalpha_buffers, rr)) {
+        if (leftover_date)
+            LOG_INFO("DestDrawLeftoverText: id=%d skip=clearalpha_mesh", m_desc.layer_id);
+        return;
+    }
+    if (leftover_date) {
+        float uv_min_u = 0.0f;
+        float uv_max_u = 0.0f;
+        float uv_min_v = 0.0f;
+        float uv_max_v = 0.0f;
+        if (clearalpha_mesh != nullptr && clearalpha_mesh->VertexCount() > 0) {
+            const auto& va = clearalpha_mesh->GetVertexArray(0);
+            const auto attrs = va.GetAttrOffsetMap();
+            const auto uv_it = attrs.find(std::string(wallpaper::WE_IN_TEXCOORD));
+            const float* data = va.Data();
+            if (uv_it != attrs.end() && data != nullptr && va.VertexCount() > 0) {
+                const usize uv_off = uv_it->second.offset / sizeof(float);
+                uv_min_u = uv_max_u = data[uv_off];
+                uv_min_v = uv_max_v = data[uv_off + 1];
+                for (uint32_t i = 1; i < va.VertexCount(); ++i) {
+                    const float* p = data + i * va.OneSize() + uv_off;
+                    uv_min_u = std::min(uv_min_u, p[0]);
+                    uv_max_u = std::max(uv_max_u, p[0]);
+                    uv_min_v = std::min(uv_min_v, p[1]);
+                    uv_max_v = std::max(uv_max_v, p[1]);
+                }
+            }
+        }
+        void* fullfb_view = nullptr;
+        void* fullfb_img = nullptr;
+        uint32_t fullfb_w = 0;
+        uint32_t fullfb_h = 0;
+        if (!m_clearalpha_fullfb.slots.empty()) {
+            const auto& image = m_clearalpha_fullfb.getActive();
+            fullfb_view = reinterpret_cast<void*>(image.view);
+            fullfb_img = reinterpret_cast<void*>(image.handle);
+            fullfb_w = image.extent.width;
+            fullfb_h = image.extent.height;
+        }
+        const uint64_t glyph_off =
+            !m_page_buffers.empty() && !m_page_buffers[0].vertex_bufs.empty()
+                ? static_cast<uint64_t>(m_page_buffers[0].vertex_bufs[0].offset)
+                : 0;
+        const uint64_t glyph_size =
+            !m_page_buffers.empty() && !m_page_buffers[0].vertex_bufs.empty()
+                ? static_cast<uint64_t>(m_page_buffers[0].vertex_bufs[0].size)
+                : 0;
+        const uint64_t ca_off =
+            !m_clearalpha_buffers.vertex_bufs.empty()
+                ? static_cast<uint64_t>(m_clearalpha_buffers.vertex_bufs[0].offset)
+                : 0;
+        const uint64_t ca_size =
+            !m_clearalpha_buffers.vertex_bufs.empty()
+                ? static_cast<uint64_t>(m_clearalpha_buffers.vertex_bufs[0].size)
+                : 0;
+        LOG_INFO("DestDrawLeftoverText: id=%d draw pages=%zu leftover_pages=%d "
+                 "extent=%ux%u dest_ortho=%d clearalpha=%d clearalpha_draw=%u "
+                 "uv=[%.2f %.2f %.2f %.2f] output='%s' view=%p out_img=%p "
+                 "fullfb_view=%p fullfb_img=%p fullfb=%ux%u same_fullfb=%d "
+                 "glyph_off=%llu glyph_size=%llu ca_off=%llu ca_size=%llu "
+                 "ubo_off=%llu ca_ubo_off=%llu",
+                 m_desc.layer_id,
+                 glyph_pages.size(),
+                 leftover_layout_local ? 1 : 0,
+                 m_desc.vk_output.extent.width,
+                 m_desc.vk_output.extent.height,
+                 m_has_dest_ortho_mvp ? 1 : 0,
+                 m_has_clearalpha && clearalpha_mesh != nullptr ? 1 : 0,
+                 m_clearalpha_buffers.draw_count,
+                 uv_min_u,
+                 uv_max_u,
+                 uv_min_v,
+                 uv_max_v,
+                 m_desc.output.c_str(),
+                 reinterpret_cast<void*>(m_desc.vk_output.view),
+                 reinterpret_cast<void*>(m_desc.vk_output.handle),
+                 fullfb_view,
+                 fullfb_img,
+                 fullfb_w,
+                 fullfb_h,
+                 fullfb_view != nullptr &&
+                         fullfb_view == reinterpret_cast<void*>(m_desc.vk_output.view)
+                     ? 1
+                     : 0,
+                 static_cast<unsigned long long>(glyph_off),
+                 static_cast<unsigned long long>(glyph_size),
+                 static_cast<unsigned long long>(ca_off),
+                 static_cast<unsigned long long>(ca_size),
+                 static_cast<unsigned long long>(m_desc.ubo_buf.offset),
+                 static_cast<unsigned long long>(
+                     m_clearalpha_ubo_buf ? m_clearalpha_ubo_buf.offset : 0));
     }
 
     auto write_uniforms = [&](const std::array<float, 4>& color) {
         TextPassUniforms uniforms {};
-        if (m_desc.scene != nullptr && m_desc.scene->shaderValueUpdater != nullptr && node != nullptr) {
+        if (m_has_dest_ortho_mvp) {
+            // DEST_ORTHO_TNF leftover dest=I dest-ortho, not private cam.
+            WriteMatrixToUniform(uniforms, m_dest_ortho_mvp);
+        } else if (m_desc.scene != nullptr && m_desc.scene->shaderValueUpdater != nullptr && node != nullptr) {
             sprite_map_t sprites;
             m_desc.scene->shaderValueUpdater->UpdateUniforms(
                 node,
@@ -821,6 +1195,37 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         rr.command.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.layout, 0, write);
     };
 
+    const bool leftover_named = LeftoverNamedDestDraw(m_desc);
+    const bool do_clearalpha =
+        leftover_named && m_has_clearalpha && m_clearalpha_pipeline.handle &&
+        m_clearalpha_pipeline.layout && m_clearalpha_ubo_buf &&
+        clearalpha_mesh != nullptr && dest_object != nullptr && m_desc.scene != nullptr;
+    if (do_clearalpha) {
+        // TEXT_E0_FLUSH930 0x1401e968a: flush before I_SLOT 0x1401e96ac /
+        // dest=I 0x1401e9702 / DEST_ORTHO_TNF 0x1401e9768. camera=FitOrtho
+        // (0x1401e937e) dest=Path B dest-STACK (0x1401e935c). +0x1ca=1 so
+        // ENGINE_FLUSH +0x930=camera*dest=LastPassMvp. composelayer g_MVP
+        // is id 0xb copies +0x930 (UNIFORM_UPLOAD_MAP). Not +0x8f0
+        // LastPassDrawMvp. FetchDest stays I-only (TEXT_E0_IDEST).
+        TextPassUniforms uniforms {};
+        WriteMatrixToUniform(uniforms, m_desc.scene->LastPassMvp());
+        uniforms.color[0] = 1.0f;
+        uniforms.color[1] = 1.0f;
+        uniforms.color[2] = 1.0f;
+        uniforms.color[3] = 0.0f;
+        rr.dyn_buf->writeToBuf(
+            m_clearalpha_ubo_buf,
+            { reinterpret_cast<uint8_t*>(const_cast<TextPassUniforms*>(&uniforms)),
+              sizeof(uniforms) });
+    }
+    if (leftover_named) {
+        // DEST_ORTHO_TNF 0x1401e9768 then TEXT_E8: glyphs +0x930 is
+        // dest-ortho * I. Same OMSet as TEXT_E0, so both UBOs flush
+        // before BeginRenderPass (ENGINE_FLUSH 0x1400d4200 analog).
+        write_uniforms(ResolveTextColor(*primitive, false));
+        rr.dyn_buf->recordUpload(rr.command);
+    }
+
     const VkExtent2D output_extent {
         .width = m_desc.vk_output.extent.width,
         .height = m_desc.vk_output.extent.height,
@@ -835,8 +1240,6 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         .pClearValues = clear_values.data(),
     };
     rr.command.BeginRenderPass(begin_info, VK_SUBPASS_CONTENTS_INLINE);
-    rr.command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.handle);
-
     VkViewport viewport {
         .x = 0.0f,
         .y = static_cast<float>(m_desc.vk_output.extent.height),
@@ -848,10 +1251,65 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
     VkRect2D scissor { { 0, 0 }, output_extent };
     rr.command.SetViewport(0, viewport);
     rr.command.SetScissor(0, scissor);
+    if (m_has_clearalpha && m_clearalpha_pipeline.handle && m_clearalpha_pipeline.layout &&
+        clearalpha_mesh != nullptr && dest_object != nullptr && m_desc.scene != nullptr) {
+        // TEXT_E0_IDEST 0x1401e968a: I=FetchDest (vt+0x80), flush
+        // composelayer_clearalpha, publish +0x5b0 ±half AABB
+        // (TEXT_CLEARALPHA_UV a_TexCoord 1,1). g_MVP is LastPassMvp
+        // +0x930 (TEXT_E0_FLUSH930). Not leftover dest-ortho and not
+        // LastPassDrawMvp +0x8f0.
+        rr.command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_clearalpha_pipeline.handle);
+        {
+            const StagingBufferRef& clearalpha_ubo =
+                m_clearalpha_ubo_buf ? m_clearalpha_ubo_buf : m_desc.ubo_buf;
+            VkDescriptorBufferInfo buffer_info {
+                rr.dyn_buf->gpuBuf(),
+                clearalpha_ubo.offset,
+                clearalpha_ubo.size,
+            };
+            VkWriteDescriptorSet ubo_write {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pBufferInfo = &buffer_info,
+            };
+            rr.command.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            *m_clearalpha_pipeline.layout, 0, ubo_write);
+            if (!m_clearalpha_fullfb.slots.empty()) {
+                const auto& image = m_clearalpha_fullfb.getActive();
+                VkDescriptorImageInfo image_info {
+                    image.sampler,
+                    image.view,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                };
+                VkWriteDescriptorSet tex_write {
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstBinding = 1,
+                    .descriptorCount = 1,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    .pImageInfo = &image_info,
+                };
+                rr.command.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                *m_clearalpha_pipeline.layout, 0, tex_write);
+            }
+        }
+        {
+            auto gpu_buf = rr.dyn_buf->gpuBuf();
+            for (usize binding_index = 0; binding_index < m_clearalpha_buffers.vertex_bufs.size();
+                 binding_index++) {
+                auto& subref = m_clearalpha_buffers.vertex_bufs[binding_index];
+                rr.command.BindVertexBuffers(static_cast<uint32_t>(binding_index), 1, &gpu_buf,
+                                             &subref.offset);
+            }
+            rr.command.Draw(m_clearalpha_buffers.draw_count, 1, 0, 0);
+        }
+    }
+    rr.command.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *m_desc.pipeline.handle);
 
     auto draw_mesh = [&](MeshBuffers& buffers, const ImageSlotsRef& texture, const std::array<float, 4>& color) {
         if (buffers.draw_count == 0) return;
-        write_uniforms(color);
+        if (!leftover_named) write_uniforms(color);
         bind_uniforms();
         bind_texture(texture);
         auto gpu_buf = rr.dyn_buf->gpuBuf();
@@ -876,7 +1334,7 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
                   ResolveTextColor(*primitive, true));
     }
 
-    for (size_t page_index = 0; page_index < primitive->glyph_pages.size(); page_index++) {
+    for (size_t page_index = 0; page_index < glyph_pages.size(); page_index++) {
         if (page_index >= m_desc.page_textures.size()) break;
         draw_mesh(m_page_buffers[page_index],
                   m_desc.page_textures[page_index],
@@ -884,6 +1342,32 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
     }
 
     rr.command.EndRenderPass();
+    if (leftover_named && m_desc.vk_output.handle != VK_NULL_HANDLE) {
+        // TEXT_E0_IDEST 0x1401e968a leftover named-RT store, then
+        // POSTFX_OMSET HORIZONTAL samples leftover. Official D3D11
+        // implicit hazard. Make COLOR_ATTACHMENT_WRITE visible as
+        // SHADER_READ before HORIZONTAL (same view as leftover bind).
+        VkImageSubresourceRange range {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        };
+        VkImageMemoryBarrier barrier {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .image = m_desc.vk_output.handle,
+            .subresourceRange = range,
+        };
+        rr.command.PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                   VK_DEPENDENCY_BY_REGION_BIT,
+                                   barrier);
+    }
 
     if (m_desc.sample_count > VK_SAMPLE_COUNT_1_BIT &&
         m_desc.output == wallpaper::SpecTex_Default) {
@@ -915,5 +1399,18 @@ void TextPass::destory(const Device&, RenderingResources& rr) {
     m_page_buffers.clear();
     rr.dyn_buf->unallocateSubRef(m_desc.ubo_buf);
     m_desc.ubo_buf = {};
+    if (m_clearalpha_ubo_buf) rr.dyn_buf->unallocateSubRef(m_clearalpha_ubo_buf);
+    m_clearalpha_ubo_buf = {};
+    for (auto& subref : m_clearalpha_buffers.vertex_bufs) {
+        rr.dyn_buf->unallocateSubRef(subref);
+    }
+    if (m_clearalpha_buffers.index_buf) rr.dyn_buf->unallocateSubRef(m_clearalpha_buffers.index_buf);
+    m_clearalpha_buffers = {};
+    m_clearalpha_pipeline.resetCachedState();
+    m_clearalpha_pipeline.handle.reset();
+    m_clearalpha_pipeline.layout.reset();
+    m_clearalpha_pipeline.pass.reset();
+    m_clearalpha_fullfb = {};
+    m_has_clearalpha = false;
     setPrepared(false);
 }

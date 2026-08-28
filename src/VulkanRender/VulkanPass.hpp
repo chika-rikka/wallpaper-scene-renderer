@@ -1,5 +1,6 @@
 #pragma once
 #include "RenderGraph/Pass.hpp"
+#include "Scene/SceneObject.h"
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -7,6 +8,7 @@
 #include <string_view>
 #include <algorithm>
 #include <unordered_set>
+#include <Eigen/Dense>
 
 namespace wallpaper
 {
@@ -73,6 +75,16 @@ public:
     virtual bool referencesRenderTarget(std::string_view) const { return false; }
     virtual bool referencesImportedTexture(std::string_view) const { return false; }
     virtual bool referencesTextLayer(int32_t) const { return false; }
+    virtual DestDrawPhase destDrawPhase() const { return DestDrawPhase::None; }
+    virtual int32_t destDrawLayerId() const { return 0; }
+    virtual wallpaper::SceneNode* destDrawNode() const { return nullptr; }
+    virtual void writeLastPassMvp(const Eigen::Matrix4f&) {}
+    // IMAGE_VT_F0 live +0x110 id 0xd / UNIFORM_UPLOAD_MAP 0x1400d8749:
+    // leftover +0x320==0 uploads +0x8f0 into the Inverse slot. Same
+    // matrix as LastPassDrawMvp, not inverse(+0x930).
+    virtual void writeLastPassInverseSlot(const Eigen::Matrix4f&) {}
+    virtual bool hasUniform(std::string_view) const { return false; }
+    virtual bool uboReady() const { return false; }
 
     bool referencesAnyRenderTarget(const std::unordered_set<std::string>& render_targets) const {
         // Selective resource refreshes are driven by render-target keys. A pass only needs to run

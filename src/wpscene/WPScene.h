@@ -49,9 +49,9 @@ public:
     float                bloomhdrfeather { 0.0f };
     int32_t              bloomhdriterations { 0 };
     bool                 cameraparallax { false };
-    float                cameraparallaxamount { 0.0f };
-    float                cameraparallaxdelay { 0.0f };
-    float                cameraparallaxmouseinfluence { 0.0f };
+    float                cameraparallaxamount { 0.5f };
+    float                cameraparallaxdelay { 0.1f };
+    float                cameraparallaxmouseinfluence { 0.5f };
     // Scene-level camera shake. These defaults match Wallpaper Engine when the keys are absent:
     // disabled, amplitude 0.5, roughness 1.0, speed 3.0.
     bool                 camerashake { false };

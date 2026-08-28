@@ -1,4 +1,5 @@
 #pragma once
+#include "WPParallaxDepth.hpp"
 #include "WPJson.hpp"
 #include "WPUserProperties.hpp"
 #include <nlohmann/json.hpp>
@@ -23,7 +24,7 @@ public:
     std::array<float, 3> origin { 0.0f, 0.0f, 0.0f };
     std::array<float, 3> scale { 1.0f, 1.0f, 1.0f };
     std::array<float, 3> angles { 0.0f, 0.0f, 0.0f };
-    std::array<float, 2> parallaxDepth { 0.0f, 0.0f };
+    std::array<float, 2> parallaxDepth { kDefaultParallaxDepth };
     std::array<float, 3> color { 1.0f, 1.0f, 1.0f };
     std::string          light;
     float                radius { 1000.0f };

@@ -1,6 +1,7 @@
 #include "SceneToRenderGraph.hpp"
 
 #include "Scene/Scene.h"
+#include "Scene/SceneMesh.h"
 #include "RenderGraph/RenderGraph.hpp"
 #include "SpecTexs.hpp"
 #include "Core/MapSet.hpp"
@@ -42,16 +43,19 @@ void addCopyPass(RenderGraph& rgraph, TexNode* in, TexNode* out,
 }
 
 void addCopyPass(RenderGraph& rgraph, const TexNode::Desc& in, const TexNode::Desc& out,
-                 std::function<bool()> should_execute = {}) {
+                 std::function<bool()> should_execute = {},
+                 DestDrawPhase dest_draw_phase = DestDrawPhase::None, i32 layer_id = 0) {
     rgraph.addPass<vulkan::CopyPass>(
         "copy",
         PassNode::Type::Copy,
-        [in, out, should_execute = std::move(should_execute)](
+        [in, out, should_execute = std::move(should_execute), dest_draw_phase, layer_id](
             RenderGraphBuilder& builder, vulkan::CopyPass::Desc& desc) {
             auto* in_node  = builder.createTexNode(in);
             auto* out_node = builder.createTexNode(out, true);
             doCopy(builder, desc, in_node, out_node);
             desc.should_execute = should_execute;
+            desc.dest_draw_phase = dest_draw_phase;
+            desc.layer_id = layer_id;
         });
 }
 
@@ -202,7 +206,21 @@ struct ExtraInfo {
     std::unordered_set<std::string> model_depth_outputs_seen {};
     bool                       use_mipmap_framebuffer { false };
     bool                       include_hidden_for_pipeline_warmup { false };
+    std::vector<SceneRenderGraphPassRecord>* inventory { nullptr };
 };
+
+static void RecordGraphPass(ExtraInfo& extra, SceneNode* node, i32 imgId,
+                            std::string_view output, std::string_view camera,
+                            DestDrawPhase dest_draw_phase) {
+    if (extra.inventory == nullptr || node == nullptr) return;
+    extra.inventory->push_back(SceneRenderGraphPassRecord {
+        .layer_id         = imgId,
+        .node_name        = node->Name(),
+        .output           = std::string(output),
+        .camera           = std::string(camera),
+        .dest_draw_phase  = dest_draw_phase,
+    });
+}
 
 static bool IsOffscreenDependencyLayer(const ExtraInfo& extra, i32 imgId) {
     return extra.scene != nullptr && imgId != 0 &&
@@ -250,7 +268,56 @@ struct NodePassOptions {
     bool        use_active_camera_for_parallax { false };
     bool        premultiplied_source_blend { false };
     bool        use_active_camera_for_uniforms { false };
+    bool        use_identity_model { false };
+    DestDrawPhase dest_draw_phase { DestDrawPhase::None };
+    // LASTPASS_DEST_STACK: leftover dest-ortho / last-pass fit-ortho are
+    // not the private WorldNode camera and not I-slot "effect".
+    bool        omit_layer_camera { false };
 };
+
+static bool IsDestDrawObject(const SceneObject* object) {
+    // Official dest-draw walker is ImageLayer / text +0x158 (LEFTOVER_VS_DESTDRAW).
+    return object != nullptr &&
+           (object->kind() == SceneObjectKind::Image || object->kind() == SceneObjectKind::Text);
+}
+
+static bool DestDrawPublishesDefault(const SceneObject* object) {
+    return object != nullptr && object->DestDrawPublishesDefault();
+}
+
+static void ApplyDestDrawLeftover(Scene& scene, SceneNode* node, i32 imgId,
+                                  NodePassOptions& options) {
+    auto* object = scene.FindSceneObject(imgId);
+    if (!IsDestDrawObject(object)) return;
+    options.dest_draw_phase = DestDrawPhase::Leftover;
+    options.use_identity_model = true;
+    options.camera_override.clear();
+    options.omit_layer_camera = true;
+    options.use_active_camera_for_uniforms = false;
+    options.use_active_camera_for_parallax = false;
+    if (object->effect_count() <= 0) {
+        // IMAGE_VT_F0 leftover +0x320==0 Draw [+0x490]. Puppet leftover-card
+        // writes puppet+0x18 verts (PUPPET_490). No-puppet IMAGE_490_MESH
+        // ±half dest. Live +0x110 id 0xd uploads +0x8f0 (LastPassDrawMvp).
+        const SceneMesh* leftover_f0 = object->image_490_mesh() != nullptr
+                                           ? object->image_490_mesh()
+                                           : object->lastpass_mesh();
+        if (leftover_f0 != nullptr && node != nullptr && node->Mesh() != nullptr) {
+            node->Mesh()->ChangeMeshDataFrom(*leftover_f0);
+            node->Mesh()->SetDirty();
+        }
+        return;
+    }
+    // IMAGE_VT_E8 dest=I 0x1401e9702. Mesh +0x2d8 IMAGE_2D8_NOFULLFB.
+    // LASTPASS_DEST_STACK: leftover private WorldNode camera is not dest-ortho.
+    object->SizeDestDrawNamedRts();
+    if (object->leftover_mesh() != nullptr && node != nullptr && node->Mesh() != nullptr) {
+        node->Mesh()->ChangeMeshDataFrom(*object->leftover_mesh());
+        // ChangeMeshDataFrom shares CPU payload only (SceneImageEffectLayer).
+        // Official leftover Draw is +0x2d8 (IMAGE_2D8_NOFULLFB 0x140208067).
+        node->Mesh()->SetDirty();
+    }
+}
 
 struct TraversalRoute {
     bool                           routed_node { false };
@@ -604,6 +671,11 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
     }
 
     std::string passName = material->name;
+    const std::string_view pass_camera = options.omit_layer_camera
+        ? std::string_view {}
+        : (! options.camera_override.empty() ? std::string_view(options.camera_override)
+                                             : std::string_view(node->Camera()));
+    RecordGraphPass(extra, node, imgId, output_key, pass_camera, options.dest_draw_phase);
     rgraph.addPass<PassT>(
         passName,
         rg::PassNode::Type::CustomShader,
@@ -630,6 +702,8 @@ static void AddNodePassImpl(SceneNode* node, std::string_view output, i32 imgId,
             pdesc.use_active_camera_for_uniforms = options.use_active_camera_for_uniforms;
             pdesc.use_active_camera_for_parallax =
                 !pdesc.camera_override.empty() && options.use_active_camera_for_parallax;
+            pdesc.use_identity_model = options.use_identity_model;
+            pdesc.dest_draw_phase = options.dest_draw_phase;
             if (!pdesc.camera_override.empty()) {
                 LOG_INFO("SceneRenderGraphComposeCameraOverride: layer=%d node='%s' "
                          "output='%s' camera='%s' active-parallax=%s",
@@ -752,7 +826,9 @@ static void AddNodePass(SceneNode* node, std::string_view output, i32 imgId, Ext
 }
 
 static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId, ExtraInfo& extra,
-                            AlphaWritePolicy alpha_write_policy) {
+                            AlphaWritePolicy alpha_write_policy,
+                            DestDrawPhase dest_draw_phase = DestDrawPhase::None,
+                            bool omit_layer_camera = false) {
     auto& rgraph = *extra.rgraph;
     auto& scene  = *extra.scene;
 
@@ -762,10 +838,13 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
 
     const std::string output_key(output);
     std::string pass_name = node->Name().empty() ? std::string("text") : node->Name();
+    const std::string_view pass_camera =
+        omit_layer_camera ? std::string_view {} : std::string_view(node->Camera());
+    RecordGraphPass(extra, node, imgId, output_key, pass_camera, dest_draw_phase);
     rgraph.addPass<vulkan::TextPass>(
         pass_name,
         rg::PassNode::Type::Text,
-        [node, output_key, imgId, alpha_write_policy, &scene, &extra](
+        [node, output_key, imgId, alpha_write_policy, dest_draw_phase, &scene, &extra](
             rg::RenderGraphBuilder& builder, vulkan::TextPass::Desc& pdesc) {
             const auto& pass = builder.workPassNode();
             // Text is now emitted as its own render-graph pass. It shares the same constrained
@@ -777,6 +856,7 @@ static void AddTextNodePass(SceneNode* node, std::string_view output, i32 imgId,
             // refresh the exact Clock/TextPass resources without broadening the dirty target set.
             pdesc.layer_id = imgId;
             pdesc.execute_when_hidden = ShouldExecuteHiddenDependency(scene, node, output_key);
+            pdesc.dest_draw_phase = dest_draw_phase;
             pdesc.output = output_key;
             pdesc.alpha_write_policy = output_key != SpecTex_Default
                 ? alpha_write_policy
@@ -850,8 +930,15 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
         rg::addClearPass(*extra.rgraph, rg::createTexDesc(std::string(output), extra.scene));
     }
 
+    auto* dest_object = scene.FindSceneObject(imgId);
+    const bool dest_leftover_required =
+        IsDestDrawObject(dest_object) && dest_object->leftover_mesh() != nullptr &&
+        (node == nullptr || node->Text() == nullptr) &&
+        (dest_object->effect_count() > 0 ||
+         (dest_object->kind() == SceneObjectKind::Image && !route.compose_source));
+
     if (source_route.seed_empty_proxy_compose_from_framebuffer &&
-        HasRenderableMeshMaterial(node)) {
+        HasRenderableMeshMaterial(node) && !dest_leftover_required) {
         LOG_INFO("SceneRenderGraphComposeFramebufferSeed: layer=%d name='%s' output='%.*s' "
                  "policy=%.*s reason='empty-proxy-visible-framebuffer-source'",
                  NodeLayerId(scene, node),
@@ -874,7 +961,7 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
     }
 
     if (HasRenderableMeshMaterial(node) &&
-        source_route.owner_node_contributes_to_effect_source) {
+        (source_route.owner_node_contributes_to_effect_source || dest_leftover_required)) {
         if (source_route.owner_node_source_fallback) {
             LOG_INFO("SceneRenderGraphComposeOwnerSourceFallback: layer=%d name='%s' output='%.*s' "
                      "policy=%.*s reason='%.*s' framebuffer-uniforms=%s",
@@ -893,13 +980,22 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                      source_route.owner_node_source_fallback_samples_framebuffer ? "true"
                                                                                  : "false");
         }
+        auto leftover_options = BuildOwnerSourcePassOptions(
+            imgeff, output, inherited_output, route, source_route);
+        ApplyDestDrawLeftover(scene, node, imgId, leftover_options);
+        // IMAGE_VT_F0 leftover +0x320==0 OMSet is FullFB, not +0x2c8
+        // named-RT (IMAGE_DRAW_PASS bit2 clear).
+        const std::string_view leftover_output =
+            dest_object != nullptr && dest_object->effect_count() <= 0 &&
+                    dest_object->kind() == SceneObjectKind::Image && !route.compose_source
+                ? std::string_view(SpecTex_Default)
+                : output;
         AddNodePass(node,
-                    output,
+                    leftover_output,
                     imgId,
                     extra,
                     node_execute_gate,
-                    BuildOwnerSourcePassOptions(
-                        imgeff, output, inherited_output, route, source_route));
+                    leftover_options);
     } else if (HasRenderableMeshMaterial(node) && imgeff != nullptr &&
                !source_route.seed_empty_proxy_compose_from_framebuffer) {
         LOG_INFO("SceneRenderGraphComposeOwnerSourceSkip: layer=%d name='%s' output='%.*s' "
@@ -919,12 +1015,24 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
             imgeff == nullptr && route.compose_source
                 ? route.compose_source_alpha_write_policy
                 : AlphaWritePolicy::Preserve;
-        AddTextNodePass(node, output, imgId, extra, text_alpha_write_policy);
+        DestDrawPhase text_phase = DestDrawPhase::None;
+        bool text_omit_camera = false;
+        if (auto* object = scene.FindSceneObject(imgId); IsDestDrawObject(object)) {
+            text_phase = DestDrawPhase::Leftover;
+            if (object->effect_count() > 0) {
+                // Date +0x320>0 leftover is dest-ortho named-RT dest=I
+                // (DEST_ORTHO_TNF), not TEXT_VT_F0 and not private cam.
+                object->SizeDestDrawNamedRts();
+                text_omit_camera = true;
+            }
+        }
+        AddTextNodePass(node, output, imgId, extra, text_alpha_write_policy, text_phase,
+                        text_omit_camera);
     }
 
     if (node != nullptr) {
-        if (auto detached_it = scene.detachedEffectSourceNodesByWorldNode.find(node);
-            detached_it != scene.detachedEffectSourceNodesByWorldNode.end()) {
+        if (auto detached_it = scene.detachedEffectSourceNodesByLayerNode.find(node);
+            detached_it != scene.detachedEffectSourceNodesByLayerNode.end()) {
             for (auto* source_node : detached_it->second) {
                 if (source_node == nullptr) continue;
                 LOG_INFO("SceneRenderGraphDetachedSourceRoute: world-layer=%d source-layer=%d "
@@ -1029,7 +1137,7 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                            ? imgeff->CompositionChildAlphaWritePolicy()
                            : AlphaWritePolicy::Preserve);
             ToGraphPass(child.node,
-                        output,
+                        child_compose_source_route ? output : inherited_output,
                         NodeLayerId(scene, child.node),
                         extra,
                         {},
@@ -1043,6 +1151,17 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
         }
     }
 
+    auto* dest_object_for_resolve = scene.FindSceneObject(imgId);
+    const bool leftover_only_image =
+        dest_object_for_resolve != nullptr &&
+        dest_object_for_resolve->kind() == SceneObjectKind::Image &&
+        dest_object_for_resolve->effect_count() <= 0 && !route.compose_source;
+    if (imgeff != nullptr && leftover_only_image) {
+        // IMAGE_VT_F0 leftover +0x320==0 already published Default. Skip
+        // ResolveEffect / FinalNode so the layer mesh stays +0x490 +/-half
+        // (IMAGE_490_MESH). No FinalNode/HEAD restore.
+        imgeff = nullptr;
+    }
     if (imgeff != nullptr) {
         // Composite source nodes may now be transform-only containers whose children draw into the
         // effect source target. Resolving the effect after all descendants have emitted their passes
@@ -1134,6 +1253,10 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                               &resolved_effect_world_affine,
                               final_output_capability);
 
+        auto* dest_object = scene.FindSceneObject(imgId);
+        const bool dest_draw_effects = dest_object != nullptr && dest_object->DestDrawHasEffects();
+        const bool dest_draw_last_pass = DestDrawPublishesDefault(dest_object);
+
         for (usize i = 0; i < imgeff->EffectCount(); i++) {
             auto& eff     = imgeff->GetEffect(i);
             auto  cmdItor = eff->commands.begin();
@@ -1145,12 +1268,19 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
             auto effect_hidden_gate = [eff]() {
                 return eff != nullptr && !eff->LocalVisible();
             };
+            const bool last_effect = (i + 1 == imgeff->EffectCount());
             for (auto& effect_node : eff->nodes) {
                 if (cmdItor != cmdEnd && nodePos == cmdItor->afterpos) {
+                    // LEFTOVER_VS_DESTDRAW: leftover then POSTFX copies then
+                    // last-pass are one dest-draw. Copies left in m_passes run
+                    // after DestDraw last-pass and feed empty FullCompo.
                     rg::addCopyPass(*extra.rgraph,
                                     rg::createTexDesc(cmdItor->src, extra.scene),
                                     rg::createTexDesc(cmdItor->dst, extra.scene),
-                                    effect_visible_gate);
+                                    effect_visible_gate,
+                                    dest_draw_effects ? DestDrawPhase::PostFx
+                                                      : DestDrawPhase::None,
+                                    imgId);
                     cmdItor++;
                 }
                 // Effect material nodes are private render-graph passes. They can carry a camera
@@ -1159,17 +1289,87 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                 // and treating this internal pass as another image-effect owner recursively
                 // rebuilds the chain while it is being emitted, overwriting the already-resolved
                 // puppet and layer-surface publication route.
+                std::string_view effect_output = effect_node.output;
+                NodePassOptions effect_options {
+                    .alpha_write_policy = effect_node.alpha_write_policy,
+                    .clear_before_draw = effect_node.clear_before_draw,
+                    .camera_override = effect_node.camera_override,
+                    .use_active_camera_for_parallax =
+                        effect_node.use_active_camera_for_parallax,
+                    .use_identity_model = effect_node.use_identity_model };
+                if (dest_draw_effects) {
+                    const bool last_node = (&effect_node == &eff->nodes.back());
+                    if (dest_draw_last_pass && last_effect && last_node) {
+                        // POSTFX_OMSET: VERTICAL no-target keeps leftover FullFB
+                        // after HORIZONTAL pop (compose Default). POSTFX_MESH
+                        // +0x2e8. Date last-pass g_MVP is +0x930 (VERTICAL_MVP_ID).
+                        // IMAGE last-pass combo uploads +0x8f0 (LASTPASS_IMAGE_ID
+                        // / 0x1400d8749). Not I-slot ping-pong / FinalNode blit.
+                        effect_options.dest_draw_phase = DestDrawPhase::LastPass;
+                        effect_options.camera_override.clear();
+                        effect_options.omit_layer_camera = true;
+                        effect_options.use_identity_model = true;
+                        effect_output = SpecTex_Default;
+                        // POSTFX_OMSET pass1 bind is HORIZONTAL
+                        // `_rt_FullCompoBuffer1`. Remapping last output to
+                        // Default must not leave g_Texture0 as Default (PrePass
+                        // clear) or the unwritten last-node ping-pong.
+                        std::string previous;
+                        for (auto it = eff->nodes.begin(); it != eff->nodes.end(); ++it) {
+                            if (&*it == &effect_node) break;
+                            if (!it->output.empty()) previous = it->output;
+                        }
+                        if (previous.empty()) previous = imgeff->FirstTarget();
+                        if (effect_node.sceneNode != nullptr &&
+                            effect_node.sceneNode->Mesh() != nullptr &&
+                            effect_node.sceneNode->Mesh()->Material() != nullptr) {
+                            auto* last_mat = effect_node.sceneNode->Mesh()->Material();
+                            // DEST_1F0_WRITERS 0x1401ea0b6: last-pass Draw uses
+                            // dest +0x1f0 (IMAGE_DEST_BLEND / FinalBlend), not
+                            // ResolveEffectPingPongChain Normal. LASTPASS_WRITES
+                            // 0x1401ec209 restores combo+0x1f0 after Draw.
+                            // Forced Normal is ONE/ZERO/DONT_CARE and punches
+                            // leftover FullFB with transparent-black dest-size.
+                            last_mat->blenmode = imgeff->FinalBlend();
+                            if (!previous.empty()) {
+                                const std::string last_out = effect_node.output;
+                                for (auto& tex : last_mat->textures) {
+                                    if (tex == SpecTex_Default || tex == last_out) {
+                                        tex = previous;
+                                    }
+                                }
+                            }
+                        }
+                        if (dest_object->lastpass_mesh() != nullptr &&
+                            effect_node.sceneNode != nullptr &&
+                            effect_node.sceneNode->Mesh() != nullptr) {
+                            effect_node.sceneNode->Mesh()->ChangeMeshDataFrom(
+                                *dest_object->lastpass_mesh());
+                            effect_node.sceneNode->Mesh()->SetDirty();
+                        }
+                    } else {
+                        // POSTFX_MESH: HORIZONTAL esi!=+0x144 → +0x2e0 ±1.
+                        // I-internal (I_SLOT). omit_layer_camera: leftover
+                        // WorldNode camera is not dest-ortho / not I.
+                        effect_options.dest_draw_phase = DestDrawPhase::PostFx;
+                        effect_options.camera_override.clear();
+                        effect_options.omit_layer_camera = true;
+                        effect_options.use_identity_model = true;
+                        if (dest_object->postfx_mesh() != nullptr &&
+                            effect_node.sceneNode != nullptr &&
+                            effect_node.sceneNode->Mesh() != nullptr) {
+                            effect_node.sceneNode->Mesh()->ChangeMeshDataFrom(
+                                *dest_object->postfx_mesh());
+                            effect_node.sceneNode->Mesh()->SetDirty();
+                        }
+                    }
+                }
                 AddNodePass(effect_node.sceneNode.get(),
-                            effect_node.output,
+                            effect_output,
                             imgId,
                             extra,
                             effect_visible_gate,
-                            NodePassOptions {
-                                .alpha_write_policy = effect_node.alpha_write_policy,
-                                .clear_before_draw = effect_node.clear_before_draw,
-                                .camera_override = effect_node.camera_override,
-                                .use_active_camera_for_parallax =
-                                    effect_node.use_active_camera_for_parallax });
+                            effect_options);
                 nodePos++;
             }
             if (!eff->BypassSource().empty() && !eff->BypassTarget().empty() &&
@@ -1182,15 +1382,38 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                 rg::addCopyPass(*extra.rgraph,
                                 rg::createTexDesc(eff->BypassSource(), extra.scene),
                                 rg::createTexDesc(eff->BypassTarget(), extra.scene),
-                                effect_hidden_gate);
+                                effect_hidden_gate,
+                                dest_draw_effects ? DestDrawPhase::PostFx
+                                                  : DestDrawPhase::None,
+                                imgId);
             }
         }
 
-        if (imgeff->HasFinalComposite()) {
-            // The image-effect layer decides whether the neutral final composite is acting as the
-            // ordinary stable publisher or only as a hidden-effect bypass fallback. Keeping that
-            // policy inside SceneImageEffectLayer avoids shader/name special cases in the graph
-            // traversal while still preserving direct authored final writers for static chains.
+        if (dest_object != nullptr && dest_object->Flag304Bit4() && dest_draw_effects &&
+            !route.compose_source) {
+            // IMAGE_VT_F8 / DRAW_FLAG304: bit4 leftover-MVP onto leftover
+            // FullFB after leftover dest-ortho + in-loop dest-draw. Not
+            // POSTFX last-pass dest-card of leftover RT (0x1401ea151).
+            // Official leftover dest-ortho Draws +0x2d8; leftover-MVP Draws
+            // +0x490 (PUPPET_490 / IMAGE_VT_F8_PUPPET). Bind +0x490 on a
+            // leftover-MVP node so prepare/upload is not leftover dest card.
+            NodePassOptions leftover_mvp {
+                .use_identity_model = true,
+                .dest_draw_phase = DestDrawPhase::LeftoverMvp,
+                .omit_layer_camera = true,
+            };
+            SceneNode* leftover_mvp_node = dest_object->EnsureLeftoverMvpNode(node);
+            if (leftover_mvp_node != nullptr) {
+                AddNodePass(leftover_mvp_node,
+                            SpecTex_Default,
+                            imgId,
+                            extra,
+                            node_execute_gate,
+                            leftover_mvp);
+            }
+        }
+
+        if (imgeff->HasFinalComposite() && !dest_draw_effects) {
             auto final_composite_gate = [imgeff]() {
                 return imgeff != nullptr && imgeff->ShouldRunFinalComposite();
             };
@@ -1207,9 +1430,7 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                             .compose_source = route.compose_source,
                             .compose_source_camera = source_route.active_compose_source_camera,
                             .compose_source_alpha_write_policy =
-                                route.compose_source_alpha_write_policy,
-                            .premultiplied_source_blend =
-                                imgeff->FinalCompositeSamplesPremultipliedSource() });
+                                route.compose_source_alpha_write_policy });
         }
     }
 
@@ -1236,12 +1457,14 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
 }
 
 static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
-    Scene& scene, bool include_hidden_for_pipeline_warmup) {
+    Scene& scene, bool include_hidden_for_pipeline_warmup,
+    std::vector<SceneRenderGraphPassRecord>* inventory) {
     std::unique_ptr<rg::RenderGraph> rgraph = std::make_unique<rg::RenderGraph>();
     ExtraInfo                        extra { .rgraph = rgraph.get(),
                                              .scene = &scene,
                                              .include_hidden_for_pipeline_warmup =
-                                                 include_hidden_for_pipeline_warmup };
+                                                 include_hidden_for_pipeline_warmup,
+                                             .inventory = inventory };
     for (size_t index = 0; index < scene.layerOrder.size(); index++) {
         extra.layer_order_index[scene.layerOrder[index]] = index;
     }
@@ -1250,7 +1473,7 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
              scene.layerOrder.size(),
              scene.renderOrderProxyChildren.size(),
              scene.renderOrderProxyNodes.size(),
-             scene.detachedEffectSourceNodesByWorldNode.size(),
+             scene.detachedEffectSourceNodesByLayerNode.size(),
              scene.detachedEffectSourceNodes.size(),
              include_hidden_for_pipeline_warmup ? "true" : "false");
     if (scene.renderTargets.count(std::string(SpecTex_Reflection)) != 0) {
@@ -1389,9 +1612,14 @@ static std::unique_ptr<rg::RenderGraph> SceneToRenderGraphImpl(
 }
 
 std::unique_ptr<rg::RenderGraph> wallpaper::sceneToRenderGraph(Scene& scene) {
-    return SceneToRenderGraphImpl(scene, false);
+    return SceneToRenderGraphImpl(scene, false, nullptr);
+}
+
+std::unique_ptr<rg::RenderGraph> wallpaper::sceneToRenderGraph(
+    Scene& scene, std::vector<SceneRenderGraphPassRecord>* inventory) {
+    return SceneToRenderGraphImpl(scene, false, inventory);
 }
 
 std::unique_ptr<rg::RenderGraph> wallpaper::sceneToPipelineWarmupRenderGraph(Scene& scene) {
-    return SceneToRenderGraphImpl(scene, true);
+    return SceneToRenderGraphImpl(scene, true, nullptr);
 }

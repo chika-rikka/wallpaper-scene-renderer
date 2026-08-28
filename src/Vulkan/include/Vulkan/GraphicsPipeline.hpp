@@ -76,7 +76,8 @@ public:
 
     void toDefault();
     bool create(const Device&, vvk::RenderPass&, PipelineParameters&,
-                GraphicsPipelineStateCache* cache = nullptr);
+                GraphicsPipelineStateCache* cache = nullptr,
+                bool own_pass = true);
 
     VkPipelineMultisampleStateCreateInfo   multisample {};
     VkPipelineRasterizationStateCreateInfo raster {};

@@ -353,7 +353,8 @@ std::string GraphicsPipeline::buildCacheKey(std::string_view compatibility_key) 
 
 bool GraphicsPipeline::create(const Device& device, vvk::RenderPass& pass,
                               PipelineParameters& pipeline,
-                              GraphicsPipelineStateCache* cache) {
+                              GraphicsPipelineStateCache* cache,
+                              bool own_pass) {
     const char* debug_name = pipeline.debug_name.empty() ? "(unnamed)" : pipeline.debug_name.c_str();
     const auto cache_key =
         pipeline.cache_key.empty() ? std::string {} : buildCacheKey(pipeline.cache_key);
@@ -523,9 +524,16 @@ bool GraphicsPipeline::create(const Device& device, vvk::RenderPass& pass,
     LOG_INFO("GraphicsPipeline: create graphics pipeline success name=%s pipeline=%p",
              debug_name,
              reinterpret_cast<void*>(*pipeline.cached_state->handle));
-    pipeline.cached_state->pass = std::move(pass);
-    pipeline.pass.handle = *pipeline.cached_state->pass;
-    if (cache != nullptr && !cache_key.empty()) {
+    if (own_pass) {
+        pipeline.cached_state->pass = std::move(pass);
+        pipeline.pass.handle = *pipeline.cached_state->pass;
+    } else {
+        // TEXT_E0_IDEST 0x1401e968a then TEXT_E8 share the leftover
+        // named-RT OMSet (0x1401e9681). Borrow that VkRenderPass; do
+        // not steal leftover TextPass ownership.
+        pipeline.pass.handle = *pass;
+    }
+    if (own_pass && cache != nullptr && !cache_key.empty()) {
         cache->store(cache_key, pipeline.cached_state);
         LOG_INFO("GraphicsPipelineCache: store name=%s key=%s cached-states=%zu",
                  debug_name,

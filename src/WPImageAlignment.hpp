@@ -56,4 +56,16 @@ inline Eigen::Matrix4d RemoveImageAlignmentOffsetFromModel(
     return model * inverse_alignment.matrix();
 }
 
+// Official text vt+0x80 0x140256e10: FetchDest into +0x554, then
+// T += dest.R * (+0x2f8, +0x2fc, +0x300). FetchDest itself stays origin+scale*basis
+// (0x140185150). Draw 0x1401e8aa0 uses this copy, not raw +0xe0.
+inline Eigen::Matrix4d ApplyTextDestLocalOffset(const Eigen::Matrix4d& dest,
+                                                const Eigen::Vector3f& local_offset) {
+    if (local_offset.isZero(0.0f)) return dest;
+
+    Eigen::Affine3d local = Eigen::Affine3d::Identity();
+    local.translate(local_offset.cast<double>());
+    return dest * local.matrix();
+}
+
 } // namespace wallpaper

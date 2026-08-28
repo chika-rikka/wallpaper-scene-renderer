@@ -15,6 +15,9 @@ public:
     ~MaskedMeshPass() override = default;
 
     void setDescTex(u32 index, std::string_view texture_key);
+    DestDrawPhase destDrawPhase() const override;
+    int32_t destDrawLayerId() const override;
+    void writeLastPassMvp(const Eigen::Matrix4f&) override;
 
     void prepare(Scene&, const Device&, RenderingResources&) override;
     void prepareDeferred(Scene&, const Device&, RenderingResources&) override;

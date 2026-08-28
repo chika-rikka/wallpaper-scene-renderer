@@ -510,6 +510,7 @@ private:
             RefreshRenderGraphIfNeeded();
 
             // LOG_INFO("frame info, fps: %.1f, frametime: %.1f", 1.0f, 1000.0f*m_scene->frameTime);
+            // Path B walker is ComposeDrawWalker after command.Begin (0x14018aac0).
             m_scene->shaderValueUpdater->FrameBegin();
             {
                 auto pos = m_mouse_pos.load();

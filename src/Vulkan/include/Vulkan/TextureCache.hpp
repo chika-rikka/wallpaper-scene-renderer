@@ -97,6 +97,11 @@ public:
                                          bool persist = false);
 
     void RecordUploads(vvk::CommandBuffer&);
+    // TEXT_2F0 0x140258a02 / TEXT_E0_IDEST 0x1401e9681: leftover named-RT
+    // exists at OMSet before TEXT_E0 overwrite. TREE Query queues an
+    // UNDEFINED image; flush that bootstrap before leftover Draw so
+    // LOAD + clearalpha is a valid first write, not a discarded RP.
+    void RecordPendingRenderTargetClears(vvk::CommandBuffer&);
     void RetireCompletedUploads();
     void MarkShareReady(std::string_view key);
     void BeginDeferredGraphActivation();

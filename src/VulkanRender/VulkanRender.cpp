@@ -5,6 +5,7 @@
 #include "RenderGraph/RenderGraph.hpp"
 #include "Scene/Scene.h"
 #include "Scene/SceneMesh.h"
+#include "Scene/SceneNode.h"
 #include "SpecTexs.hpp"
 #include "Interface/IImageParser.h"
 #include "Interface/IShaderValueUpdater.h"
@@ -49,6 +50,8 @@
 #endif
 
 using namespace wallpaper::vulkan;
+using wallpaper::DestDrawGfx;
+using wallpaper::DestDrawPhase;
 
 constexpr uint64_t vk_wait_time { 10u * 1000u * 1000000u };
 constexpr uint32_t vk_command_num { 1 };
@@ -75,6 +78,16 @@ namespace
 std::mutex& VulkanInitMutex() {
     static std::mutex mutex;
     return mutex;
+}
+
+void RunComposeDrawWalker(wallpaper::Scene& scene, wallpaper::DestDrawGfx* gfx) {
+    // FRAME_DEST_NO_RESET 0x14018aac0 / PATH_B 0x14018b170: dest-draw after
+    // GPU record start, leftover then last-pass before dest pop
+    // (LEFTOVER_VS_DESTDRAW).
+    scene.BindDestDrawGfx(gfx);
+    if (scene.shaderValueUpdater != nullptr)
+        scene.shaderValueUpdater->ComposeDrawWalker();
+    scene.BindDestDrawGfx(nullptr);
 }
 
 std::string MakeResidencyInstanceKey(
@@ -122,9 +135,19 @@ const char* ExternalMemoryPreferenceName(wallpaper::ExternalFrameMemoryPreferenc
 
 } // namespace
 
-struct VulkanRender::Impl {
+struct VulkanRender::Impl : wallpaper::DestDrawGfx {
     Impl()  = default;
     ~Impl() = default;
+
+    void Record(wallpaper::SceneObject& object) override;
+    void ClearDestDrawPasses();
+    void IndexDestDrawPass(VulkanPass* pass);
+    void PrepareDestDrawPasses(Scene&);
+    void RefreshDestDrawPasses(Scene&, bool refresh_all,
+                               const std::unordered_set<std::string>& dirty_render_targets,
+                               const std::unordered_set<std::string>& dirty_imported_textures,
+                               const std::unordered_set<int32_t>& dirty_text_layers);
+    void DestroyDestDrawPasses();
 
     bool init(RenderInitInfo);
     void destroy();
@@ -191,6 +214,12 @@ struct VulkanRender::Impl {
 
     std::vector<VulkanPass*> m_passes;
     std::vector<std::shared_ptr<rg::Pass>> m_compiled_pass_refs;
+    std::unordered_map<int32_t, std::vector<VulkanPass*>> m_dest_leftover;
+    std::unordered_map<int32_t, VulkanPass*> m_dest_leftover_mvp;
+    std::unordered_map<int32_t, std::vector<VulkanPass*>> m_dest_postfx;
+    std::unordered_map<int32_t, VulkanPass*> m_dest_lastpass;
+    std::vector<VulkanPass*> m_dest_draw_all;
+    std::unordered_set<int32_t> m_dest_draw_contracts_logged;
 
 };
 
@@ -468,6 +497,7 @@ void VulkanRender::Impl::abandonDeviceOwnedResourcesAfterFault() {
     m_cmds.abandon();
     m_compiled_pass_refs.clear();
     m_passes.clear();
+    ClearDestDrawPasses();
     (void)m_prepass.release();
     (void)m_finpass.release();
     (void)m_testpass.release();
@@ -493,6 +523,7 @@ void VulkanRender::Impl::destroy() {
         }
 
         // res
+        DestroyDestDrawPasses();
         for (auto& p : m_passes) {
             p->destory(*m_device, m_rendering_resources);
         }
@@ -760,6 +791,349 @@ void VulkanRender::Impl::processDeferredGraphPreparation(Scene& scene) {
     }
 }
 
+void VulkanRender::Impl::ClearDestDrawPasses() {
+    m_dest_leftover.clear();
+    m_dest_leftover_mvp.clear();
+    m_dest_postfx.clear();
+    m_dest_lastpass.clear();
+    m_dest_draw_all.clear();
+}
+
+void VulkanRender::Impl::IndexDestDrawPass(VulkanPass* pass) {
+    if (pass == nullptr) return;
+    const DestDrawPhase phase = pass->destDrawPhase();
+    if (phase == DestDrawPhase::None) return;
+    const int32_t layer_id = pass->destDrawLayerId();
+    m_dest_draw_all.push_back(pass);
+    if (phase == DestDrawPhase::Leftover) {
+        m_dest_leftover[layer_id].push_back(pass);
+        return;
+    }
+    if (phase == DestDrawPhase::LeftoverMvp) {
+        m_dest_leftover_mvp[layer_id] = pass;
+        return;
+    }
+    if (phase == DestDrawPhase::PostFx) {
+        m_dest_postfx[layer_id].push_back(pass);
+        return;
+    }
+    m_dest_lastpass[layer_id] = pass;
+}
+
+void VulkanRender::Impl::PrepareDestDrawPasses(Scene& scene) {
+    for (auto* pass : m_dest_draw_all) {
+        if (pass == nullptr) continue;
+        if (pass->prepared()) {
+            pass->refreshResources(scene, *m_device, m_rendering_resources);
+            continue;
+        }
+        pass->prepare(scene, *m_device, m_rendering_resources);
+    }
+}
+
+void VulkanRender::Impl::RefreshDestDrawPasses(
+    Scene& scene, bool refresh_all,
+    const std::unordered_set<std::string>& dirty_render_targets,
+    const std::unordered_set<std::string>& dirty_imported_textures,
+    const std::unordered_set<int32_t>& dirty_text_layers) {
+    for (auto* pass : m_dest_draw_all) {
+        if (pass == nullptr) continue;
+        const bool broader_resource_refresh =
+            refresh_all || pass->referencesAnyRenderTarget(dirty_render_targets) ||
+            pass->referencesAnyTextLayer(dirty_text_layers);
+        const bool imported_binding_refresh =
+            pass->referencesAnyImportedTexture(dirty_imported_textures);
+        if (!broader_resource_refresh && !imported_binding_refresh) continue;
+        if (pass->prepared()) {
+            if (broader_resource_refresh) {
+                pass->refreshResources(scene, *m_device, m_rendering_resources);
+            } else {
+                pass->refreshImportedTextureBindings(scene, *m_device);
+            }
+        }
+        if (!pass->prepared()) {
+            pass->prepare(scene, *m_device, m_rendering_resources);
+        }
+    }
+}
+
+void VulkanRender::Impl::DestroyDestDrawPasses() {
+    std::unordered_set<VulkanPass*> destroyed;
+    for (auto* pass : m_dest_draw_all) {
+        DestroyPassOnce(pass, *m_device, m_rendering_resources, destroyed);
+    }
+    ClearDestDrawPasses();
+}
+
+void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
+    // LEFTOVER_VS_DESTDRAW: leftover IMAGE_VT_E8 then POSTFX then last-pass
+    // 0x1401ea151→0x1401ebf60 while dest-STACK is live. Last-pass g_MVP is
+    // +0x930 (ENGINE_FLUSH / VERTICAL_MVP_ID 0x1400d8676).
+    RenderingResources& rr = m_rendering_resources;
+    const int32_t id = object.id();
+    const auto leftover_it = m_dest_leftover.find(id);
+    const auto leftover_mvp_it = m_dest_leftover_mvp.find(id);
+    const auto postfx_it = m_dest_postfx.find(id);
+    const auto last_it = m_dest_lastpass.find(id);
+    const bool has_dest_draw_pass =
+        leftover_it != m_dest_leftover.end() ||
+        leftover_mvp_it != m_dest_leftover_mvp.end() ||
+        postfx_it != m_dest_postfx.end() || last_it != m_dest_lastpass.end();
+    if (has_dest_draw_pass && object.scene() != nullptr &&
+        m_dest_draw_contracts_logged.insert(id).second) {
+        /*
+         * Emit the resolved contract once per layer instead of logging a selected workshop id
+         * every frame. The local card bounds, FetchDest, live dest stack, and final draw matrix
+         * are the four independent inputs that determine a dest-draw clip edge. Keeping them in
+         * one record makes a visible rectangular seam attributable without project-specific
+         * conditions or high-volume frame logging.
+         */
+        float min_x = 0.0f;
+        float max_x = 0.0f;
+        float min_y = 0.0f;
+        float max_y = 0.0f;
+        if (const auto* mesh = object.lastpass_mesh();
+            mesh != nullptr && mesh->VertexCount() > 0) {
+            const auto& va = mesh->GetVertexArray(0);
+            const float* data = va.Data();
+            if (data != nullptr && va.VertexCount() > 0 && va.OneSize() >= 2) {
+                min_x = max_x = data[0];
+                min_y = max_y = data[1];
+                for (std::size_t i = 1; i < va.VertexCount(); ++i) {
+                    const float x = data[i * va.OneSize()];
+                    const float y = data[i * va.OneSize() + 1];
+                    min_x = std::min(min_x, x);
+                    max_x = std::max(max_x, x);
+                    min_y = std::min(min_y, y);
+                    max_y = std::max(max_y, y);
+                }
+            }
+        }
+        const Eigen::Matrix4f fetch = object.FetchDest();
+        const Eigen::Matrix4f stack = object.scene()->DestStackTop();
+        const Eigen::Matrix4f draw = object.scene()->LastPassDrawMvp(object);
+        LOG_INFO("DestDrawContract: id=%d name='%s' kind=%d effects=%d "
+                 "phases=[leftover=%zu leftover-mvp=%d postfx=%zu last=%d] "
+                 "fetch-T=[%.3f %.3f] stack-T=[%.3f %.3f] "
+                 "draw-T=[%.6f %.6f] draw-s=[%.9f %.9f] "
+                 "mesh=[%.1f..%.1f, %.1f..%.1f] window=%dx%d",
+                 id,
+                 object.name().c_str(),
+                 static_cast<int>(object.kind()),
+                 object.effect_count(),
+                 leftover_it != m_dest_leftover.end() ? leftover_it->second.size() : 0u,
+                 leftover_mvp_it != m_dest_leftover_mvp.end() ? 1 : 0,
+                 postfx_it != m_dest_postfx.end() ? postfx_it->second.size() : 0u,
+                 last_it != m_dest_lastpass.end() ? 1 : 0,
+                 fetch(0, 3),
+                 fetch(1, 3),
+                 stack(0, 3),
+                 stack(1, 3),
+                 draw(0, 3),
+                 draw(1, 3),
+                 draw(0, 0),
+                 draw(1, 1),
+                 min_x,
+                 max_x,
+                 min_y,
+                 max_y,
+                 object.scene()->window_width(),
+                 object.scene()->window_height());
+    }
+    auto update_pass = [](VulkanPass* pass) {
+        if (pass != nullptr && pass->prepared()) pass->updateBeforeUpload();
+    };
+    if (object.kind() == SceneObjectKind::Text && object.effect_count() > 0 &&
+        object.scene() != nullptr) {
+        // TEXT_2F0 0x140258a02 vt+0xb8 recreates leftover +0x2c8 / FullCompo
+        // immediately before leftover Draw. Runtime dest_size can grow past
+        // parse JSON+pad (live Date +0x2f0=1412). Refresh leftover TextPass
+        // and HORIZONTAL so both Query the same AABB key this DestDraw.
+        auto refresh_named = [this, &object, &rr](VulkanPass* pass) {
+            if (pass == nullptr) return;
+            // ShaderDrawCore::refreshResources returns false (and
+            // CustomShaderPass unprepares) when a static dest card is
+            // Dirty after TEXT_2F0 AABB growth. Official vt+0xb8 still
+            // Draws this dest-draw; prepare() is the TREE recreate.
+            if (pass->prepared()) {
+                pass->refreshResources(*object.scene(), *m_device, rr);
+            }
+            if (!pass->prepared()) {
+                pass->prepare(*object.scene(), *m_device, rr);
+            }
+        };
+        if (leftover_it != m_dest_leftover.end()) {
+            for (auto* pass : leftover_it->second) refresh_named(pass);
+        }
+        if (postfx_it != m_dest_postfx.end()) {
+            for (auto* pass : postfx_it->second) refresh_named(pass);
+        }
+        if (last_it != m_dest_lastpass.end() && last_it->second != nullptr &&
+            object.lastpass_mesh() != nullptr) {
+            // TEXT_2F0 0x1402589da / POSTFX_MESH 0x1401ec667: last-pass
+            // Draw uses live +0x2e8 from (int)+0x2f0, not a parse-time
+            // snapshot. Graph build ChangeMeshDataFrom shares Data;
+            // replacing lastpass_mesh unique_ptr used to leave VERTICAL
+            // on the JSON+pad card (Date ±423 vs runtime ±723).
+            if (auto* node = last_it->second->destDrawNode();
+                node != nullptr && node->Mesh() != nullptr) {
+                node->Mesh()->ChangeMeshDataFrom(*object.lastpass_mesh());
+                node->Mesh()->SetDirty();
+            }
+        }
+        if (last_it != m_dest_lastpass.end()) refresh_named(last_it->second);
+    }
+    if (object.kind() == SceneObjectKind::Image && object.scene() != nullptr &&
+        object.leftover_mesh() != nullptr && leftover_it != m_dest_leftover.end()) {
+        // IMAGE_2D8_NOFULLFB 0x1401eb180 / IMAGE_VT_E8 0x140208067:
+        // leftover Draw +0x2d8 is flags=0 0..AABB, not last-pass
+        // +0x2e8 ±half. Owner image Mesh() stays Dynamic() after
+        // ChangeMeshDataFrom; rebind the live leftover card before
+        // dest-ortho flush so IMAGE leftover is not a puppet/±half
+        // card under dest-ortho (0,W,0,H).
+        for (auto* pass : leftover_it->second) {
+            if (auto* node = pass->destDrawNode();
+                node != nullptr && node->Mesh() != nullptr) {
+                node->Mesh()->ChangeMeshDataFrom(*object.leftover_mesh());
+                node->Mesh()->SetDirty();
+            }
+            if (pass->prepared()) {
+                pass->refreshResources(*object.scene(), *m_device, rr);
+            }
+            if (!pass->prepared()) {
+                pass->prepare(*object.scene(), *m_device, rr);
+            }
+        }
+    }
+    if (leftover_it != m_dest_leftover.end()) {
+        for (auto* pass : leftover_it->second) {
+            update_pass(pass);
+            // DEST_ORTHO_TNF leftover +0x320>0 +0x930 is dest-ortho * I.
+            // IMAGE_VT_F0 leftover +0x320==0 live +0x110 id 0xd uploads
+            // +0x8f0 (LastPassDrawMvp). Clock TEXT_VT_F0 is not this path.
+            if (pass != nullptr && pass->prepared() && object.scene() != nullptr) {
+                if (object.effect_count() > 0) {
+                    // DEST_ORTHO_TNF dest=I. IMAGE leftover mesh is 0..AABB
+                    // (IMAGE_2D8_NOFULLFB). TEXT leftover is TEXT_LAYOUT_VERTS
+                    // 0..AABB, same dest-ortho, not ±half * to_dest_center.
+                    const Eigen::Matrix4f leftover_mvp =
+                        object.scene()->LeftoverDestOrthoMvp(object);
+                    pass->writeLastPassMvp(leftover_mvp);
+                    // Leftover I is identity (IMAGE_VT_E8 0x140207c74 skips
+                    // I write). +0x8f0 = I * dest-ortho = dest-ortho
+                    // (ENGINE_FLUSH 0x1400d4323). IMAGE leftover +0x110 is
+                    // 0xd (LASTPASS_IMAGE_ID / IMAGE_VT_F0 0x1400d8749).
+                    // Same dest-ortho matrix, not leftover +0x8f0 copied
+                    // into last-pass +0x930.
+                    if (object.kind() == SceneObjectKind::Image) {
+                        pass->writeLastPassInverseSlot(leftover_mvp);
+                    }
+                } else if (object.kind() == SceneObjectKind::Image) {
+                    const Eigen::Matrix4f draw =
+                        object.scene()->LastPassDrawMvp(object);
+                    pass->writeLastPassMvp(draw);
+                    // IMAGE_VT_F0 live +0x110 id 0xd copies +0x8f0
+                    // (UNIFORM_UPLOAD_MAP 0x1400d8749). Same matrix as
+                    // LastPassDrawMvp, not inverse(+0x930).
+                    pass->writeLastPassInverseSlot(draw);
+                } else if (object.kind() == SceneObjectKind::Text) {
+                    // Clock TEXT_VT_F0 +0x320==0 FONT_MVP_SLOT id 0xb
+                    // copies +0x930 (0x1400d8676). TEXT_VT_F0 0x1402580b0
+                    // sets +0x1ca=1 so flush ENGINE_FLUSH 0x1400d4264
+                    // +0x930=camera*dest. Live 3219908811 Clock dest_p is
+                    // BASE+0x40 Path B dest-STACK (T≈parallax, not ctor
+                    // T=0; DEST_LIVE_WRITERS skip-Path-B is stale).
+                    // camera is FitOrtho (LASTPASS_CAM_ORTHO). DestDraw
+                    // already FlushLastPassMvp. +0x594 bit2 clear je
+                    // 0x1402583a8 skips fontbackground +0x2d8. Do not
+                    // write LastPassDrawMvp / +0x8f0 into +0x930.
+                    pass->writeLastPassMvp(object.scene()->LastPassMvp());
+                }
+            }
+        }
+    }
+    if (postfx_it != m_dest_postfx.end()) {
+        for (auto* pass : postfx_it->second) {
+            update_pass(pass);
+            // GFX_ORTHO_CALLS 0x1401e9a1b: after leftover dest-ortho Draw,
+            // leftover-inner type-0 (r15=0, +0x2e0 ±1) overwrites *camera
+            // with clip ortho(-1,1,-1,1). dest is still I (DEST_ORTHO_TNF
+            // 0x1401e9702; pop is 0x1401e9cd3 after this loop). +0x930 =
+            // clip-ortho * I = identity 2D. DestStackTop pixel T would
+            // throw the ±1 card off the named RT. Not FetchDest. Last-pass
+            // after DEST_BLIT stays LastPassMvp / LastPassDrawMvp.
+            if (pass != nullptr && pass->prepared()) {
+                pass->writeLastPassMvp(Eigen::Matrix4f::Identity());
+            }
+        }
+    }
+    VulkanPass* leftover_mvp =
+        leftover_mvp_it != m_dest_leftover_mvp.end() ? leftover_mvp_it->second : nullptr;
+    if (leftover_mvp != nullptr && leftover_mvp->prepared() && object.scene() != nullptr) {
+        leftover_mvp->updateBeforeUpload();
+        // IMAGE_VT_F8 leftover-MVP: leftover material combo 0xd uploads
+        // +0x8f0 (LastPassDrawMvp). Puppet Draws +0x490 (IMAGE_VT_F8_PUPPET
+        // / PUPPET_490). No-puppet Draws +0x2e8 (IMAGE_VT_F8 0x1402090fd).
+        // Not dest-ortho leftover +0x2d8 and not POSTFX last-pass leftover
+        // RT dest-card (0x1401ea151).
+        const Eigen::Matrix4f draw = object.scene()->LastPassDrawMvp(object);
+        leftover_mvp->writeLastPassMvp(draw);
+        leftover_mvp->writeLastPassInverseSlot(draw);
+    }
+    VulkanPass* last = last_it != m_dest_lastpass.end() ? last_it->second : nullptr;
+    if (last != nullptr && last->prepared()) {
+        last->updateBeforeUpload();
+        if (object.scene() != nullptr) {
+            // VERTICAL_MVP_ID 0x1400d8676: Date blur VERTICAL g_MVP is id
+            // 0xb copies +0x930 (LastPassMvp). LASTPASS_IMAGE_ID /
+            // UNIFORM_UPLOAD_MAP 0x1400d8749: IMAGE last-pass combo +0x110
+            // is 0xd then 2; that upload is +0x8f0 = LastPassDrawMvp. Do
+            // not copy +0x8f0 into +0x930 (LASTPASS_8F0_T). Clock leftover
+            // is FONT_MVP_SLOT 0xb, not this.
+            if (object.kind() == SceneObjectKind::Image) {
+                const Eigen::Matrix4f draw =
+                    object.scene()->LastPassDrawMvp(object);
+                last->writeLastPassMvp(draw);
+                last->writeLastPassInverseSlot(draw);
+            } else {
+                last->writeLastPassMvp(object.scene()->LastPassMvp());
+            }
+        }
+    }
+    if (m_vertex_buf) m_vertex_buf->recordUpload(rr.command);
+    if (m_dyn_buf) m_dyn_buf->recordUpload(rr.command);
+    rr.immutable_meshes.recordUploads(rr.command);
+    // IMAGE_VT_E8 0x140207c74 leftover Draw +0x2d8 after flush of
+    // [+0x4a0]/[+0x498]. Official layer albedo is already a D3D11 SRV.
+    // TEXT_E0_IDEST 0x1401e9681 OMSet leftover named-RT then 0x1401e968a
+    // TEXT_E0 samples FullFB. TEXT_E8 leftover glyphs follow. Official
+    // leftover RT, FullFB, and glyph atlas exist at that Draw. TREE
+    // Query during refresh queues UNDEFINED RTs and imported image
+    // uploads; dest-draw runs in the compose walker before the later
+    // frame RecordUploads. Flush both now so leftover IMAGE / TEXT_E0
+    // sample a shader-readable resource, not an unuploaded image.
+    // Bootstrap RT clear is still not official leftover content —
+    // official first write is composelayer_clearalpha / IMAGE leftover
+    // Draw.
+    m_device->tex_cache().RecordUploads(rr.command);
+    m_device->video_tex_cache().RecordUploads(rr.command);
+    auto execute_pass = [this, &rr](VulkanPass* pass) {
+        if (pass != nullptr && pass->prepared()) pass->execute(*m_device, rr);
+    };
+    if (leftover_it != m_dest_leftover.end()) {
+        for (auto* pass : leftover_it->second) execute_pass(pass);
+    }
+    if (postfx_it != m_dest_postfx.end()) {
+        for (auto* pass : postfx_it->second) execute_pass(pass);
+    }
+    if (leftover_mvp != nullptr && leftover_mvp->prepared()) {
+        // IMAGE_VT_F8_PUPPET leftover-MVP node Mesh() is +0x490 at prepare
+        // (PUPPET_490). Do not swap leftover dest-ortho +0x2d8 after upload.
+        execute_pass(leftover_mvp);
+    }
+    execute_pass(last);
+}
+
 void VulkanRender::Impl::drawFrameSwapchain() {
     static size_t resource_index = 0;
 
@@ -794,6 +1168,13 @@ void VulkanRender::Impl::drawFrameSwapchain() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     }), "begin swapchain frame command buffer"))
         return;
+    // Official last-pass writes leftover FullFB after the frame clear
+    // (POSTFX_OMSET / LEFTOVER_VS_DESTDRAW). PrePass must run first;
+    // executing it after DestDraw wipes Default.
+    if (m_prepass != nullptr && m_prepass->prepared()) {
+        m_prepass->execute(*m_device, rr);
+    }
+    if (rr.scene != nullptr) RunComposeDrawWalker(*rr.scene, this);
     // Deferred pass preparation can allocate and write static vertex/index subranges between
     // frames. Recording the static upload here keeps those newly resident passes drawable without
     // a compile-time WaitIdle, matching the frame-budgeted residency model used by streaming
@@ -804,6 +1185,13 @@ void VulkanRender::Impl::drawFrameSwapchain() {
     m_device->tex_cache().RecordUploads(rr.command);
     m_device->video_tex_cache().RecordUploads(rr.command);
     for (auto* p : m_passes) {
+        if (p == m_prepass.get()) continue;
+        // LEFTOVER_VS_DESTDRAW 0x1401e8ed9 / 0x1401ea151: leftover then
+        // POSTFX then last-pass are one dest-draw. A second DONT_CARE
+        // HORIZONTAL / IMAGE leftover in m_passes discards that write
+        // (FullCompo / leftover named-RT go uninit white). Official
+        // walker does not run 0x1401ebf60 again after DEST_DRAW_JOIN.
+        if (p->destDrawPhase() != DestDrawPhase::None) continue;
         if (p->prepared()) {
             p->execute(*m_device, rr);
         }
@@ -897,6 +1285,13 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     }), "begin offscreen frame command buffer"))
         return;
+    // Official last-pass writes leftover FullFB after the frame clear
+    // (POSTFX_OMSET / LEFTOVER_VS_DESTDRAW). Offscreen capture uses
+    // this path; PrePass after DestDraw wipes 3363252053's Default.
+    if (m_prepass != nullptr && m_prepass->prepared()) {
+        m_prepass->execute(*m_device, rr);
+    }
+    RunComposeDrawWalker(scene, this);
     m_vertex_buf->recordUpload(rr.command);
     m_dyn_buf->recordUpload(rr.command);
     rr.immutable_meshes.recordUploads(rr.command);
@@ -904,7 +1299,14 @@ void VulkanRender::Impl::drawFrameOffscreen(Scene& scene) {
     m_device->video_tex_cache().RecordUploads(rr.command);
 
     for (auto* p : m_passes) {
+        if (p == m_prepass.get()) continue;
         if (! p->prepared()) continue;
+        // LEFTOVER_VS_DESTDRAW 0x1401e8ed9 / 0x1401ea151: dest-draw
+        // already ran in the compose walker. Re-executing DONT_CARE
+        // HORIZONTAL / IMAGE leftover here discards FullCompo / leftover
+        // (SceneToRenderGraph dest-draw copies in m_passes feed empty
+        // FullCompo). Official join has no second 0x1401ebf60.
+        if (p->destDrawPhase() != DestDrawPhase::None) continue;
         p->execute(*m_device, rr);
     }
 
@@ -1130,6 +1532,7 @@ void VulkanRender::Impl::clearLastRenderGraph(bool clear_scene_caches) {
     // A topology rebuild invalidates the compiled pass list and the backing mesh buffers that were
     // uploaded for the previous graph. Reallocating those buffers keeps the full rebuild path
     // conservative and mirrors the historical behavior used when nodes were added or removed.
+    DestroyDestDrawPasses();
     for (auto& p : m_passes) {
         p->destory(*m_device, m_rendering_resources);
     }
@@ -1270,6 +1673,8 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
             !dirty_text_layers.empty();
         const bool refresh_all =
             scene.renderGraphAllResourcesDirty || !has_targeted_dirty_resources;
+        RefreshDestDrawPasses(scene, refresh_all, dirty_render_targets, dirty_imported_textures,
+                              dirty_text_layers);
         std::size_t refreshed_passes = 0;
         std::size_t prepared_passes = 0;
 
@@ -1323,10 +1728,12 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
     auto node_release_texs = rg.getLastReadTexs(nodes);
 
     m_passes.clear();
+    ClearDestDrawPasses();
     m_deferred_prepare_indices.clear();
     m_deferred_waiting_indices_logged.clear();
     m_device->tex_cache().CancelDeferredGraphActivation();
-    m_passes.resize(nodes.size());
+    std::vector<VulkanPass*> graph_passes;
+    graph_passes.reserve(nodes.size());
 
     std::unordered_map<std::string, std::shared_ptr<rg::Pass>> reusable_passes;
     std::unordered_map<std::string, std::size_t> old_key_counts;
@@ -1384,9 +1791,14 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
         for (auto& tex : node_release_texs[index]) {
             vpass->addReleaseTexs(spanone<const std::string_view> { tex->key() });
         }
-        m_passes[index] = vpass;
+        if (vpass->destDrawPhase() != DestDrawPhase::None) {
+            IndexDestDrawPass(vpass);
+        } else {
+            graph_passes.push_back(vpass);
+        }
         next_compiled_pass_refs.push_back(std::move(pass_ref));
     }
+    m_passes = std::move(graph_passes);
 
     std::unordered_set<VulkanPass*> destroyed_passes;
     std::size_t retired_count = 0;
@@ -1408,6 +1820,21 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
 
     m_passes.insert(m_passes.begin(), m_prepass.get());
     m_passes.push_back(m_finpass.get());
+
+    // Dest-draw moved a large share of the compiled graph out of m_passes and into the
+    // ComposeDrawWalker. Whatever stays behind still runs after the whole walker, so the two
+    // lists together describe the frame's real submission order. Report the residue by identity
+    // instead of by layer so a mis-partitioned pass is attributable without per-project logging.
+    for (std::size_t residue_index = 0; residue_index < m_passes.size(); ++residue_index) {
+        const auto* residue_pass = m_passes[residue_index];
+        if (residue_pass == nullptr) continue;
+        const auto residue_key = residue_pass->residencyKey();
+        LOG_INFO("RenderGraphPassResidue: index=%zu key='%s' phase=%d layer=%d",
+                 residue_index,
+                 residue_key.empty() ? "(anonymous)" : residue_key.c_str(),
+                 static_cast<int>(residue_pass->destDrawPhase()),
+                 residue_pass->destDrawLayerId());
+    }
 
     setRenderTargetSize(scene, rg);
 
@@ -1431,6 +1858,7 @@ void VulkanRender::Impl::compileRenderGraph(Scene& scene, rg::RenderGraph& rg,
         p->prepare(scene, *m_device, m_rendering_resources);
         dependency_prepared_count++;
     }
+    PrepareDestDrawPasses(scene);
     for (size_t pass_index = 0; pass_index < m_passes.size(); ++pass_index) {
         auto* p = m_passes[pass_index];
         if (p != nullptr && reused_passes.count(p) != 0 && p->prepared()) {

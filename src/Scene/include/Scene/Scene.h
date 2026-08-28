@@ -2,10 +2,12 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <memory>
 #include <future>
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -14,6 +16,7 @@
 #include "SceneTexture.h"
 #include "SceneRenderTarget.h"
 #include "SceneNode.h"
+#include "SceneObject.h"
 #include "SceneLight.hpp"
 #include "WPSceneScriptHost.hpp"
 #include "WPTextLayer.hpp"
@@ -127,6 +130,57 @@ public:
     void                ClearLayerParentBinding(int32_t layer_id);
     std::vector<int32_t> GetLayerChildren(int32_t layer_id) const;
 
+    SceneObject*       FindSceneObject(int32_t layer_id);
+    const SceneObject* FindSceneObject(int32_t layer_id) const;
+    SceneObject*       FindSceneObjectForNode(const SceneNode* node);
+    const SceneObject* FindSceneObjectForNode(const SceneNode* node) const;
+    SceneObject&       EnsureSceneObject(int32_t layer_id);
+    void               BindSceneObjectParent(int32_t layer_id, int32_t parent_id,
+                                             std::string_view attachment);
+
+    // Official engine dest [engine+0x38] (DEST_IDENTITY_CTOR dest=engine+0x4f0).
+    // Path B push-copy 0x40, T+= ox·col0+oy·col1, dest-draw, pop (PATH_B).
+    // TREE hosts that slot here (official scene+0xd8 engine). ComposeDrawWalker
+    // is 0x14018aac0 (FRAME_DEST_NO_RESET). DestDraw is the vt+0x50 slot
+    // (PATH_B 0x14018b170). Dest-draw GPU is DestDrawGfx (engine+0x1518).
+    void                      DestStackResetIdentity();
+    void                      DestStackPushCopy();
+    void                      DestStackPop();
+    void                      DestStackApplyPathB(SceneObject& object, float lookat_x,
+                                                  float lookat_y, float amount);
+    const Eigen::Matrix4f&    DestStackTop() const;
+    bool                      DestStackAtBase() const;
+    // FULLFB_SIZE engine+0x84/+0x88 (VIEW_ORTHO_LR). Last-pass camera uses this
+    // window, not scene.ortho canvas.
+    void                      SetWindowSize(int32_t w, int32_t h);
+    int32_t                   window_width() const { return m_window_w; }
+    int32_t                   window_height() const { return m_window_h; }
+    // LASTPASS_CAM_ORTHO / VIEW_ORTHO_LR / GFX_ORTHO18 0x14009a630.
+    Eigen::Matrix4f           FitOrthoCamera() const;
+    // DEST_ORTHO_TNF 0x1401e9768 / GFX_ORTHO18: leftover named-RT
+    // ortho(0,W,0,H,-1000,1000). dest=I (0x1401e9702 / LASTPASS_8F0_T).
+    // Not dest-STACK, not last-pass fit-ortho.
+    Eigen::Matrix4f           DestOrthoCamera(float width, float height) const;
+    Eigen::Matrix4f           LeftoverDestOrthoMvp(const SceneObject& object) const;
+    // DEST_ORTHO_TNF dest=I. TREE leftover text quads are ±half layout
+    // (WPTextLayer), not leftover +0x2d8 0..AABB. Translate dest-ortho by
+    // half dest so dest-local 0 lands at named-RT center.
+    Eigen::Matrix4f           LeftoverTextDestOrthoMvp(const SceneObject& object) const;
+    // ENGINE_FLUSH 0x1400d4264: +0x930 = camera * dest. DestDraw last-pass
+    // only (LEFTOVER_VS_DESTDRAW). Not UpdateUniforms.
+    void                      FlushLastPassMvp();
+    const Eigen::Matrix4f&    LastPassMvp() const { return m_last_pass_mvp; }
+    // DEST_BLIT 0x1401e9dd5 I*=FetchDest (I stack only). ENGINE_FLUSH
+    // 0x1400d4323 +0x8f0 = I * (camera*dest). Date last-pass VERTICAL
+    // g_MVP is id 0xb copies +0x930 (VERTICAL_MVP_ID). IMAGE leftover
+    // +0x320==0 (IMAGE_VT_F0) and IMAGE last-pass (LASTPASS_IMAGE_ID)
+    // upload this +0x8f0 stand-in. Do not copy it into +0x930.
+    Eigen::Matrix4f           LastPassDrawMvp(SceneObject& object) const;
+    // Official dest-draw gfx is [engine+0x1518]. TREE analog is this Scene
+    // slot, bound after command.Begin (LEFTOVER_VS_DESTDRAW).
+    void                      BindDestDrawGfx(DestDrawGfx* gfx) { m_dest_draw_gfx = gfx; }
+    DestDrawGfx*              dest_draw_gfx() const { return m_dest_draw_gfx; }
+
     void SetLayerLocalVisibility(int32_t layer_id, bool visible);
     bool GetLayerLocalVisibility(int32_t layer_id) const;
     bool IsLayerVisible(int32_t layer_id) const;
@@ -184,6 +238,12 @@ public:
     std::vector<WPSceneScriptRegistration> scriptRegistrations;
     std::vector<WPSceneScriptRegistration> propertyAnimationRegistrations;
     std::vector<int32_t>                 layerOrder;
+    // Official [scene+0x158] parse-order object list (0x140190837).
+    std::vector<SceneObject*>            objectList;
+    // Official [scene+0x144] (0x1401850c9 / 0x14018512e). Ctor/heap leaves it 0;
+    // .text has no add/inc of this slot. FetchDest copies it into object +0xd0.
+    uint32_t                             destStamp { 0 };
+    std::unordered_map<int32_t, std::unique_ptr<SceneObject>> sceneObjects;
     std::unordered_map<int32_t, SceneNode*> layerNodes;
     std::unordered_map<int32_t, LayerParentBinding> layerParentBindings;
     std::unordered_map<int32_t, bool>    layerLocalVisibility;
@@ -211,11 +271,15 @@ public:
     // the node's transform/output ownership model.
     std::unordered_map<SceneNode*, std::vector<SceneNode*>> renderOrderProxyChildren;
     std::unordered_set<SceneNode*>                          renderOrderProxyNodes;
+    // Official passthrough (composelayer/projectlayer) sets +0x120 bit2
+    // (0x1401faeb8 / 0x1401fb35f). Drawable children of those layers skip
+    // `_rt_FullFrameBuffer` at 0x1401e8f6f. Empties are not in this set.
+    std::unordered_set<int32_t>                             passthroughLayerIds;
     // Effect-backed image/text layers split into a visible world node plus a root-owned source
     // node that draws through the effect camera. The source must render at the world node's
     // authored position in sibling order, then be skipped when the physical root traversal reaches
     // the root-owned source node later.
-    std::unordered_map<SceneNode*, std::vector<SceneNode*>> detachedEffectSourceNodesByWorldNode;
+    std::unordered_map<SceneNode*, std::vector<SceneNode*>> detachedEffectSourceNodesByLayerNode;
     std::unordered_set<SceneNode*>                          detachedEffectSourceNodes;
     UserPropertyMap                      userProperties;
     std::set<std::string>                dirtyImportedTextureKeys;
@@ -497,6 +561,14 @@ public:
     }
 
 private:
+    static constexpr size_t kDestStackSlots = 8;
+    std::array<Eigen::Matrix4f, kDestStackSlots> m_dest_slots {};
+    size_t m_dest_index { 0 };
+    int32_t m_window_w { 0 };
+    int32_t m_window_h { 0 };
+    Eigen::Matrix4f m_last_pass_mvp { Eigen::Matrix4f::Identity() };
+    DestDrawGfx* m_dest_draw_gfx { nullptr };
+
     struct PendingParsedImageRequest {
         std::future<std::shared_ptr<Image>>    future;
         std::chrono::steady_clock::time_point  started_at;

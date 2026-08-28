@@ -39,9 +39,28 @@ std::size_t EstimateParsedImageBytes(const std::shared_ptr<Image>& image) {
     return total;
 }
 
+// GFX_ORTHO18 0x14009a630. Column-major: m00=2/(r-l), m11=2/(t-b),
+// m22=-1/(f-n), T=(-(r+l)/(r-l), -(t+b)/(t-b), -(f+n)/(f-n)).
+Eigen::Matrix4f GfxOrtho18(float l, float r, float b, float t, float n, float f) {
+    if (!(r > l) || !(t > b)) return Eigen::Matrix4f::Identity();
+    Eigen::Matrix4f cam = Eigen::Matrix4f::Zero();
+    cam(0, 0)           = 2.0f / (r - l);
+    cam(1, 1)           = 2.0f / (t - b);
+    cam(2, 2)           = -1.0f / (f - n);
+    cam(0, 3)           = -(r + l) / (r - l);
+    cam(1, 3)           = -(t + b) / (t - b);
+    cam(2, 3)           = -(f + n) / (f - n);
+    cam(3, 3)           = 1.0f;
+    return cam;
+}
+
 bool IsLayerVisibleImpl(const Scene& scene, int32_t layer_id, std::unordered_set<int32_t>& visiting) {
     if (layer_id == 0) return true;
     if (!visiting.insert(layer_id).second) return true;
+
+    if (const auto* object = scene.FindSceneObject(layer_id)) {
+        return object->EffectiveVisible();
+    }
 
     const auto visible_it = scene.layerLocalVisibility.find(layer_id);
     const bool local_visible =
@@ -250,7 +269,120 @@ void ApplyCameraProjectionState(Scene& scene,
 }
 } // namespace
 
-Scene::Scene(): sceneGraph(std::make_shared<SceneNode>()) ,paritileSys(std::make_unique<ParticleSystem>(*this)) {}
+Scene::Scene(): sceneGraph(std::make_shared<SceneNode>()) ,paritileSys(std::make_unique<ParticleSystem>(*this)) {
+    DestStackResetIdentity();
+}
+
+void Scene::DestStackResetIdentity() {
+    // DEST_IDENTITY_CTOR 0x14017d5a2: *dest = 4x4 identity, pointer stays base.
+    m_dest_slots[0] = Eigen::Matrix4f::Identity();
+    m_dest_index    = 0;
+}
+
+void Scene::DestStackPushCopy() {
+    // PATH_B 0x14018b01e: dest pointer += 0x40, copy 0x40 bytes from previous.
+    if (m_dest_index + 1 >= kDestStackSlots) return;
+    m_dest_slots[m_dest_index + 1] = m_dest_slots[m_dest_index];
+    ++m_dest_index;
+}
+
+void Scene::DestStackPop() {
+    // PATH_B 0x14018b17a: dest pointer -= 0x40.
+    if (m_dest_index == 0) return;
+    --m_dest_index;
+}
+
+void Scene::DestStackApplyPathB(SceneObject& object, float lookat_x, float lookat_y,
+                               float amount) {
+    const SceneObject* root = object.Root();
+    // PATH_B 0x14018b062: walk +0x180 to ROOT; ox/oy from ROOT +0x128/+0x170.
+    const float ox =
+        (root->origin().x() - lookat_x) * amount * root->parallax_depth().x();
+    const float oy =
+        (root->origin().y() - lookat_y) * amount * root->parallax_depth().y();
+    object.set_leftover_parallax(ox, oy);
+    auto& dest = m_dest_slots[m_dest_index];
+    // PATH_B 0x14018b118: T += ox·col0 + oy·col1. Dest 3x3 at entry is identity.
+    dest.col(3) += ox * dest.col(0) + oy * dest.col(1);
+}
+
+const Eigen::Matrix4f& Scene::DestStackTop() const {
+    return m_dest_slots[m_dest_index];
+}
+
+bool Scene::DestStackAtBase() const {
+    return m_dest_index == 0;
+}
+
+void Scene::SetWindowSize(int32_t w, int32_t h) {
+    m_window_w = w;
+    m_window_h = h;
+}
+
+Eigen::Matrix4f Scene::FitOrthoCamera() const {
+    // VIEW_ORTHO_LR 0x140183b75 / GFX_ORTHO18 0x14009a630. Default cover,
+    // pad 0.5, fliph 0. Do not use TREE Ortho() (Vulkan Z remap).
+    const float cw = static_cast<float>(ortho[0]);
+    const float ch = static_cast<float>(ortho[1]);
+    const float ww = static_cast<float>(m_window_w);
+    const float wh = static_cast<float>(m_window_h);
+    if (!(cw > 0.0f) || !(ch > 0.0f) || !(ww > 0.0f) || !(wh > 0.0f)) {
+        return Eigen::Matrix4f::Identity();
+    }
+    float l = 0.0f;
+    float r = cw;
+    float b = 0.0f;
+    float t = ch;
+    if (cw / ch > ww / wh) {
+        const float vw = ch * ww / wh;
+        l              = (cw - vw) * 0.5f;
+        r              = (cw + vw) * 0.5f;
+    } else {
+        const float vh = cw * wh / ww;
+        b              = (ch - vh) * 0.5f;
+        t              = (ch + vh) * 0.5f;
+    }
+    return GfxOrtho18(l, r, b, t, -2000.0f, 2000.0f);
+}
+
+Eigen::Matrix4f Scene::DestOrthoCamera(float width, float height) const {
+    // DEST_ORTHO_TNF Date leftover: l=0 r=W b=0 t=H n=-1000 f=1000.
+    // LIVE_LASTPASS_930 leftover PRE +0x930 is 2/W, 2/H, Tx=Ty=-1.
+    if (!(width > 0.0f) || !(height > 0.0f)) return Eigen::Matrix4f::Identity();
+    return GfxOrtho18(0.0f, width, 0.0f, height, -1000.0f, 1000.0f);
+}
+
+Eigen::Matrix4f Scene::LeftoverDestOrthoMvp(const SceneObject& object) const {
+    // IMAGE_2D8_NOFULLFB / EFFECT_FBO_SIZE: named-RT is max(4,AABB). dest=I.
+    const int32_t dest_w = static_cast<int32_t>(object.dest_size().x());
+    const int32_t dest_h = static_cast<int32_t>(object.dest_size().y());
+    return DestOrthoCamera(static_cast<float>(std::max(4, dest_w)),
+                           static_cast<float>(std::max(4, dest_h)));
+}
+
+Eigen::Matrix4f Scene::LeftoverTextDestOrthoMvp(const SceneObject& object) const {
+    const int32_t dest_w = std::max(4, static_cast<int32_t>(object.dest_size().x()));
+    const int32_t dest_h = std::max(4, static_cast<int32_t>(object.dest_size().y()));
+    Eigen::Matrix4f to_dest_center = Eigen::Matrix4f::Identity();
+    to_dest_center(0, 3)           = 0.5f * static_cast<float>(dest_w);
+    to_dest_center(1, 3)           = 0.5f * static_cast<float>(dest_h);
+    return LeftoverDestOrthoMvp(object) * to_dest_center;
+}
+
+void Scene::FlushLastPassMvp() {
+    // ENGINE_FLUSH 0x1400d4264: +0x930 = *camera * *dest. camera is
+    // LASTPASS_CAM_ORTHO fit-ortho; dest is Path B dest-STACK.
+    m_last_pass_mvp = FitOrthoCamera() * DestStackTop();
+}
+
+Eigen::Matrix4f Scene::LastPassDrawMvp(SceneObject& object) const {
+    // DEST_BLIT 0x1401e9dd5 / LASTPASS_8F0_T: I*=FetchDest, then
+    // +0x8f0 = I * +0x930. Date last-pass upload is LastPassMvp
+    // (VERTICAL_MVP_ID id 0xb). IMAGE leftover +0x320==0 (IMAGE_VT_F0)
+    // and IMAGE last-pass (LASTPASS_IMAGE_ID) upload this +0x8f0
+    // stand-in. Do not copy it into +0x930.
+    return LastPassMvp() * object.FetchDest();
+}
 
 Scene::~Scene() {
     ClearParsedImageCache();
@@ -540,12 +672,14 @@ void Scene::SetLayerParentBinding(int32_t layer_id, int32_t parent_id, std::stri
     if (layer_id == 0) return;
     if (parent_id == 0 && attachment.empty()) {
         layerParentBindings.erase(layer_id);
+        if (auto* object = FindSceneObject(layer_id)) object->set_parent(nullptr, -1);
         return;
     }
     layerParentBindings[layer_id] = LayerParentBinding {
         .parent_id = parent_id,
         .attachment = std::move(attachment),
     };
+    BindSceneObjectParent(layer_id, parent_id, layerParentBindings[layer_id].attachment);
 }
 
 Scene::LayerParentBinding Scene::GetLayerParentBinding(int32_t layer_id) const {
@@ -558,6 +692,14 @@ void Scene::ClearLayerParentBinding(int32_t layer_id) {
 }
 
 std::vector<int32_t> Scene::GetLayerChildren(int32_t layer_id) const {
+    if (const auto* object = FindSceneObject(layer_id); object != nullptr) {
+        std::vector<int32_t> children;
+        children.reserve(object->children().size());
+        for (auto* child : object->children()) {
+            if (child != nullptr) children.push_back(child->id());
+        }
+        if (! children.empty()) return children;
+    }
     std::vector<int32_t> children;
     for (const auto& [child_id, binding] : layerParentBindings) {
         if (binding.parent_id == layer_id) children.push_back(child_id);
@@ -565,10 +707,55 @@ std::vector<int32_t> Scene::GetLayerChildren(int32_t layer_id) const {
     return children;
 }
 
+SceneObject* Scene::FindSceneObject(int32_t layer_id) {
+    auto it = sceneObjects.find(layer_id);
+    return it == sceneObjects.end() ? nullptr : it->second.get();
+}
+
+const SceneObject* Scene::FindSceneObject(int32_t layer_id) const {
+    auto it = sceneObjects.find(layer_id);
+    return it == sceneObjects.end() ? nullptr : it->second.get();
+}
+
+SceneObject* Scene::FindSceneObjectForNode(const SceneNode* node) {
+    return const_cast<SceneObject*>(
+        static_cast<const Scene*>(this)->FindSceneObjectForNode(node));
+}
+
+const SceneObject* Scene::FindSceneObjectForNode(const SceneNode* node) const {
+    if (node == nullptr) return nullptr;
+    auto owner = nodeOwners.find(const_cast<SceneNode*>(node));
+    // owner 0 is bloom/post handles, not an objects[] SceneObject (SO1 0x140190837).
+    if (owner != nodeOwners.end() && owner->second != 0) return FindSceneObject(owner->second);
+    const int32_t node_id = const_cast<SceneNode*>(node)->ID();
+    if (node_id != 0 && sceneObjects.count(node_id) != 0) return FindSceneObject(node_id);
+    return nullptr;
+}
+
+SceneObject& Scene::EnsureSceneObject(int32_t layer_id) {
+    if (auto* existing = FindSceneObject(layer_id)) return *existing;
+    auto object = std::make_unique<SceneObject>(this, layer_id);
+    auto* raw   = object.get();
+    sceneObjects.emplace(layer_id, std::move(object));
+    objectList.push_back(raw);
+    return *raw;
+}
+
+void Scene::BindSceneObjectParent(int32_t layer_id, int32_t parent_id,
+                                  std::string_view attachment) {
+    auto* child = FindSceneObject(layer_id);
+    if (child == nullptr) return;
+    auto* parent = parent_id != 0 ? FindSceneObject(parent_id) : nullptr;
+    // 0x1401de931 / 0x14018802c: +0x180 parent*, +0x190 attach index or -1,
+    // r8 adjustTransforms=0 so 0x1401de928 skips attach-zero 0x1401de962.
+    child->set_parent(parent, attachment.empty() ? -1 : 0);
+}
+
 void Scene::SetLayerLocalVisibility(int32_t layer_id, bool visible) {
     if (layer_id == 0) return;
 
     layerLocalVisibility[layer_id] = visible;
+    if (auto* object = FindSceneObject(layer_id)) object->set_local_visible(visible);
 }
 
 bool Scene::GetLayerLocalVisibility(int32_t layer_id) const {

@@ -92,22 +92,22 @@ bool WPImageObject::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     // Project-layer is authored in the utility model JSON. Reading it here keeps the later parser
     // decision tied to the resolved asset metadata instead of relying only on a hard-coded path.
     GET_JSON_NAME_VALUE_NOWARN(jImage, "projectlayer", projectlayer);
+    // Official models/util/composelayer.json and projectlayer.json set
+    // passthrough at the model root. Image parse 0x1401fae95 reads that key
+    // and 0x1401faeb8 ors +0x304 bit5, which 0x1401fb35f copies to +0x120 bit2.
+    GET_JSON_NAME_VALUE_NOWARN(jImage, "passthrough", config.passthrough);
 	GET_JSON_NAME_VALUE_NOWARN(json, "name", name);
 	GET_JSON_NAME_VALUE_NOWARN(json, "id", id);
 	GET_JSON_NAME_VALUE_NOWARN(json, "parent", parent);
 	GET_JSON_NAME_VALUE_NOWARN(json, "attachment", attachment);
 	GET_JSON_NAME_VALUE_NOWARN(json, "colorBlendMode", colorBlendMode);
     GET_JSON_NAME_VALUE_NOWARN(json, "copybackground", copybackground);
-	if(!fullscreen) {
-		GET_JSON_NAME_VALUE(json, "origin", origin);	
-		GET_JSON_NAME_VALUE(json, "angles", angles);	
-		GET_JSON_NAME_VALUE(json, "scale", scale);	
-        // Record field presence before resolving the numeric default. An omitted child inherits
-        // its parent contract, whereas an explicit value owns its parallax depth.
-        parallaxDepthAuthored = json.contains("parallaxDepth") && ! json.at("parallaxDepth").is_null();
-        parallaxDepth = kDefaultParallaxDepth;
-        GET_JSON_NAME_VALUE_NOWARN(json, "parallaxDepth", parallaxDepth);
-    }
+	GET_JSON_NAME_VALUE(json, "origin", origin);
+	GET_JSON_NAME_VALUE(json, "angles", angles);
+	GET_JSON_NAME_VALUE(json, "scale", scale);
+    parallaxDepthAuthored = json.contains("parallaxDepth") && ! json.at("parallaxDepth").is_null();
+    parallaxDepth = kDefaultParallaxDepth;
+    GET_JSON_NAME_VALUE_NOWARN(json, "parallaxDepth", parallaxDepth);
     GET_JSON_NAME_VALUE_NOWARN(jImage, "nopadding", nopadding);
     GET_JSON_NAME_VALUE_NOWARN(json, "color", color);
     GET_JSON_NAME_VALUE_NOWARN(json, "alpha", alpha);

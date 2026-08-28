@@ -166,6 +166,7 @@ inline void ApplySign(Eigen::Vector3d& p, int32_t x, int32_t y, int32_t z) noexc
 } // namespace
 
 ParticleEmittOp ParticleBoxEmitterArgs::MakeEmittOp(ParticleBoxEmitterArgs a) {
+    // PARTICLE_SEQ_RESET: phase is packed [system+0x80]+8, not runtime.sequence.
     uint64_t sequence { 0 };
     return [a, sequence](std::vector<Particle>&       ps,
                          std::vector<ParticleInitOp>& inis,

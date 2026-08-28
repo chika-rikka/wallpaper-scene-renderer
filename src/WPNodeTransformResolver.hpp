@@ -19,7 +19,7 @@ public:
                             Map<void*, Eigen::Vector3f>& parallax_offset_cache,
                             Map<void*, Eigen::Affine3f>& attachment_transform_cache,
                             const SceneCamera* parallax_camera,
-                            const std::array<float, 2>& mouse_pos,
+                            std::array<float, 2> parallax_lookat,
                             uint64_t puppet_frame_serial);
 
     Eigen::Matrix4d ResolveParallaxedModelTransform(SceneNode* node,
@@ -27,6 +27,9 @@ public:
                                                     bool apply_parallax);
     Eigen::Matrix4d ResolveRawModelTransform(SceneNode* node);
     Eigen::Vector3f ResolveParallaxOffset(SceneNode* node, const SceneCamera* camera);
+    // World XY translation of the scene camera-parallax offset.
+    static void ApplyParallaxThroughLayerAxes(Eigen::Matrix4d& model,
+                                              const Eigen::Vector3f& offset);
     std::optional<Eigen::Affine3f> ResolveAttachmentLocalTransform(SceneNode* node);
     bool                           ApplyAttachment(SceneNode* node);
     void                           UpdateAttachmentParentIfNeeded(const WPShaderValueData& node_data);
@@ -37,12 +40,6 @@ private:
     Eigen::Vector3f          ComputeParallaxOffset(SceneNode* node,
                                                    const WPShaderValueData& node_data,
                                                    const SceneCamera* camera);
-    void ApplyResolvedParentDelta(SceneNode* target_parent,
-                                  const WPShaderValueData& parent_data,
-                                  Eigen::Affine3f& local_transform);
-    void ApplyParentParallaxToAttachment(SceneNode* parent_node,
-                                         const WPShaderValueData& parent_data,
-                                         Eigen::Affine3f& local_transform);
     std::optional<Eigen::Affine3f> ResolveAttachmentLocalTransform(SceneNode* node,
                                                                    const WPShaderValueData& node_data);
 
@@ -53,7 +50,9 @@ private:
     Map<void*, Eigen::Vector3f>&   m_parallax_offset_cache;
     Map<void*, Eigen::Affine3f>&   m_attachment_transform_cache;
     const SceneCamera*             m_parallax_camera;
-    const std::array<float, 2>&    m_mouse_pos;
+    // Official lookat lives at [scene+0x340/+0x344] (0x14018b07d). Copy the
+    // snapshot; a caller temporary must not dangle.
+    std::array<float, 2>           m_parallax_lookat;
     uint64_t                       m_puppet_frame_serial;
 };
 

@@ -179,15 +179,15 @@ void UpdatePuppetProjectionDerivedValues(PuppetSurfaceProjection& projection) {
 }
 } // namespace
 
-// The width and height parameters remain in the public constructor to preserve the existing parser
-// call contract; effect geometry is copied from the resolved source/final meshes during
-// ResolveEffect(), so the constructor only records the world node and ping-pong target names.
-SceneImageEffectLayer::SceneImageEffectLayer(SceneNode* node, float /*w*/, float /*h*/,
+// Official image +0x2f0/+0x2f4 (0x1401ec338). Keep authored size for g_ETVP.
+SceneImageEffectLayer::SceneImageEffectLayer(SceneNode* node, float w, float h,
                                              std::string_view pingpong_a,
                                              std::string_view pingpong_b)
-    : m_worldNode(node),
+    : m_layer_node(node),
       m_pingpong_a(pingpong_a),
       m_pingpong_b(pingpong_b),
+      m_authored_width(w),
+      m_authored_height(h),
       m_source_mesh(std::make_unique<SceneMesh>()),
       m_final_mesh(std::make_unique<SceneMesh>()),
       m_final_node(std::make_unique<SceneNode>()) {};
@@ -215,7 +215,7 @@ void SceneImageEffectLayer::SetPuppetSurfaceProjection(PuppetSurfaceProjection p
         !projection.authored_pose_bounds.IsFiniteAndOrdered() ||
         !projection.surface_bounds.IsFiniteAndOrdered()) {
         LOG_ERROR("ScenePuppetProjectionInit: layer=%d has invalid asset/authored/surface bounds",
-                  m_worldNode != nullptr ? m_worldNode->ID() : -1);
+                  m_layer_node != nullptr ? m_layer_node->ID() : -1);
         return;
     }
     UpdatePuppetProjectionDerivedValues(projection);
@@ -245,7 +245,7 @@ bool SceneImageEffectLayer::PreparePuppetSurface(Scene& scene, const SceneMesh& 
     if (!observed.IsFiniteAndOrdered()) {
         LOG_ERROR("ScenePuppetSurfacePrepare: layer=%d frame=%llu revision=%llu produced invalid "
                   "runtime bounds",
-                  m_worldNode != nullptr ? m_worldNode->ID() : -1,
+                  m_layer_node != nullptr ? m_layer_node->ID() : -1,
                   static_cast<unsigned long long>(frame_serial),
                   static_cast<unsigned long long>(pose.revision));
         return false;
@@ -451,15 +451,15 @@ void SceneImageEffectLayer::SyncResolvedOutputMesh() {
 }
 
 void SceneImageEffectLayer::SyncResolvedNodeToWorld() {
-    if (m_worldNode == nullptr) return;
+    if (m_layer_node == nullptr) return;
 
-    m_worldNode->UpdateTrans();
+    m_layer_node->UpdateTrans();
     // Final effect nodes are emitted as render-graph-only nodes, not as real children of the
     // authored scene node. Copying only the local TRS loses virtual parent transforms used by
     // render-order proxy groups such as Wallpaper Engine compose layers. Resolve the full world
     // matrix here so the final screen writer lands in the same place as the authored layer.
     Eigen::Affine3f world_affine;
-    world_affine.matrix() = m_worldNode->ModelTrans().cast<float>();
+    world_affine.matrix() = m_layer_node->ModelTrans().cast<float>();
     m_final_node->SetLocalAffine(world_affine);
     m_final_node->UpdateTrans();
 
@@ -529,6 +529,7 @@ SceneImageEffectNode* SceneImageEffectLayer::ResolveEffectPingPongChain(
             it->sceneNode->SetCamera(effect_cam.data());
             it->camera_override.clear();
             it->use_active_camera_for_parallax = false;
+            it->use_identity_model             = false;
             it->clear_before_draw              = false;
             it->alpha_write_policy             = AlphaWritePolicy::Preserve;
             it->sceneNode->CopyTrans(default_node);
@@ -574,8 +575,9 @@ SceneImageEffectLayer::ResolveFinalOutputDecision(
         fallback_last_output->private_final_output_uses_layer_surface && !m_fullscreen &&
         !layer_surface_cam.empty();
     m_final_composite.uses_source_mesh = decision.private_final_uses_layer_surface;
-    m_final_composite.samples_premultiplied_source =
-        decision.private_final_uses_layer_surface && m_final_blend == BlendMode::Translucent;
+    // Official translucent dest is SRC_ALPHA/INV_SRC_ALPHA (GFX_BLEND_DESC
+    // 0x14009a32b), not a second premul publisher.
+    m_final_composite.samples_premultiplied_source = false;
 
     return decision;
 }
@@ -606,8 +608,8 @@ void SceneImageEffectLayer::ResolveFinalCompositeNode(
         mesh.ChangeMeshDataFrom(default_mesh);
         LOG_INFO("SceneEffectFinalCompositeResolve: layer=%d name='%s' fullscreen=true "
                  "camera='%.*s' output='%s' source='%s' blend=%d",
-                 m_worldNode != nullptr ? m_worldNode->ID() : -1,
-                 m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+                 m_layer_node != nullptr ? m_layer_node->ID() : -1,
+                 m_layer_node != nullptr ? m_layer_node->Name().c_str() : "",
                  static_cast<int>(effect_cam.size()),
                  effect_cam.data(),
                  std::string(final_output).c_str(),
@@ -632,8 +634,8 @@ void SceneImageEffectLayer::ResolveFinalCompositeNode(
     LOG_INFO("SceneEffectFinalCompositeResolve: layer=%d name='%s' fullscreen=false "
              "camera='' output='%s' source='%s' blend=%d publish=%s "
              "publish-private=%s source-mesh=%s policy=%d",
-             m_worldNode != nullptr ? m_worldNode->ID() : -1,
-             m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+             m_layer_node != nullptr ? m_layer_node->ID() : -1,
+             m_layer_node != nullptr ? m_layer_node->Name().c_str() : "",
              std::string(final_output).c_str(),
              std::string(final_composite_source).c_str(),
              static_cast<int>(material.blenmode),
@@ -670,8 +672,8 @@ void SceneImageEffectLayer::ResolveVisibleFinalOutput(
         mesh.ChangeMeshDataFrom(default_mesh);
         LOG_INFO("SceneEffectFinalOutputResolve: layer=%d name='%s' fullscreen=true "
                  "camera='%.*s' output='%s' material='%s' blend=%d",
-                 m_worldNode != nullptr ? m_worldNode->ID() : -1,
-                 m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+                 m_layer_node != nullptr ? m_layer_node->ID() : -1,
+                 m_layer_node != nullptr ? m_layer_node->Name().c_str() : "",
                  static_cast<int>(effect_cam.size()),
                  effect_cam.data(),
                  std::string(final_output).c_str(),
@@ -687,8 +689,8 @@ void SceneImageEffectLayer::ResolveVisibleFinalOutput(
     mesh.ChangeMeshDataFrom(*m_final_mesh);
     LOG_INFO("SceneEffectFinalOutputResolve: layer=%d name='%s' fullscreen=false "
              "camera='' output='%s' material='%s' blend=%d private=false",
-             m_worldNode != nullptr ? m_worldNode->ID() : -1,
-             m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+             m_layer_node != nullptr ? m_layer_node->ID() : -1,
+             m_layer_node != nullptr ? m_layer_node->Name().c_str() : "",
              std::string(final_output).c_str(),
              material.name.c_str(),
              static_cast<int>(material.blenmode));
@@ -740,6 +742,9 @@ void SceneImageEffectLayer::ResolvePrivateFinalOutput(
         final_output_node.sceneNode->SetCamera(std::string());
         final_output_node.camera_override = std::string(layer_surface_cam);
         final_output_node.use_active_camera_for_parallax = false;
+        // Official 0x1401ec799: I-internal writes I. This writer is that pass
+        // (0x14020805e [instance+0x400]); dest publication stays FetchDest.
+        final_output_node.use_identity_model = true;
         final_output_node.alpha_write_policy = AlphaWritePolicy::SourceOver;
         // The private layer-surface target is freshly cleared before the skinned draw so coverage
         // outside the current pose never survives from an earlier animation frame.
@@ -748,9 +753,10 @@ void SceneImageEffectLayer::ResolvePrivateFinalOutput(
         mesh.ChangeMeshDataFrom(*m_final_mesh);
         LOG_INFO("SceneEffectFinalOutputResolve: layer=%d name='%s' fullscreen=false "
                  "camera-override='%.*s' output='%s' material='%s' blend=%d private=true "
-                 "publish-composite=%s publish-private=%s layer-surface=true",
-                 m_worldNode != nullptr ? m_worldNode->ID() : -1,
-                 m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+                 "publish-composite=%s publish-private=%s layer-surface=true "
+                 "identity-model=true",
+                 m_layer_node != nullptr ? m_layer_node->ID() : -1,
+                 m_layer_node != nullptr ? m_layer_node->Name().c_str() : "",
                  static_cast<int>(layer_surface_cam.size()),
                  layer_surface_cam.data(),
                  final_output_node.output.c_str(),
@@ -768,8 +774,8 @@ void SceneImageEffectLayer::ResolvePrivateFinalOutput(
     LOG_INFO("SceneEffectFinalOutputResolve: layer=%d name='%s' fullscreen=false "
              "camera='%.*s' output='%s' material='%s' blend=%d private=true "
              "publish-composite=%s publish-private=%s",
-             m_worldNode != nullptr ? m_worldNode->ID() : -1,
-             m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+             m_layer_node != nullptr ? m_layer_node->ID() : -1,
+             m_layer_node != nullptr ? m_layer_node->Name().c_str() : "",
              static_cast<int>(effect_cam.size()),
              effect_cam.data(),
              final_output_node.output.c_str(),
@@ -793,10 +799,17 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
     m_resolved_output_follows_world = true;
     m_resolved_output_mesh_follows_final_mesh = true;
     m_final_composite.ResetForResolve();
-    SyncResolvedNodeForRoute(resolved_world_affine);
 
     auto* fallback_last_output =
         ResolveEffectPingPongChain(default_mesh, default_node, effect_cam, ppong_a, ppong_b);
+    if (EffectCount() > 0) {
+        // Official dest-draw leftover then last-pass 0x1401ebf60 on one +0x158
+        // object. ResolveFinalComposite / ResolveVisibleFinalOutput copy
+        // FinalNode dest + FinalMesh onto the last pass — that is the
+        // WorldNode/FinalNode split, not 0x1401ebf60.
+        return;
+    }
+    SyncResolvedNodeForRoute(resolved_world_affine);
     const auto final_decision = ResolveFinalOutputDecision(fallback_last_output,
                                                            layer_surface_cam,
                                                            keep_final_output_private,
@@ -824,8 +837,8 @@ void SceneImageEffectLayer::ResolveEffect(const SceneMesh& default_mesh,
              "private-parallax-owner='%.*s' publication-parallax-owner='%.*s' "
              "parallax-application-count=%u keep-authored-final-private=%s "
              "copybackground=%s",
-             m_worldNode != nullptr ? m_worldNode->ID() : -1,
-             m_worldNode != nullptr ? m_worldNode->Name().c_str() : "",
+             m_layer_node != nullptr ? m_layer_node->ID() : -1,
+             m_layer_node != nullptr ? m_layer_node->Name().c_str() : "",
              static_cast<int>(FinalOutputCapabilityName(m_final_output_capability).size()),
              FinalOutputCapabilityName(m_final_output_capability).data(),
              static_cast<int>(FinalOutputCapabilityName(output_capability).size()),

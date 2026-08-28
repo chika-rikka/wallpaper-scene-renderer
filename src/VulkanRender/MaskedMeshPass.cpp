@@ -1,5 +1,8 @@
 #include "MaskedMeshPass.hpp"
 
+#include "Scene/SceneShader.h"
+#include "SpecTexs.hpp"
+
 namespace wallpaper::vulkan
 {
 
@@ -85,6 +88,16 @@ bool MaskedMeshPass::referencesImportedTexture(std::string_view texture_key) con
 
 void MaskedMeshPass::setDescTex(u32 index, std::string_view texture_key) {
     m_visible_draw.setTexture(index, texture_key);
+}
+
+wallpaper::DestDrawPhase MaskedMeshPass::destDrawPhase() const {
+    return m_visible_draw.data().dest_draw_phase;
+}
+
+int32_t MaskedMeshPass::destDrawLayerId() const { return m_visible_draw.data().layer_id; }
+
+void MaskedMeshPass::writeLastPassMvp(const Eigen::Matrix4f& mvp) {
+    m_visible_draw.WriteUniform(G_MVP, ShaderValue::fromMatrix(mvp));
 }
 
 } // namespace wallpaper::vulkan

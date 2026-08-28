@@ -3,8 +3,10 @@
 #include "Eigen/src/Core/Matrix.h"
 #include "Eigen/src/Geometry/Transform.h"
 #include "Scene/Scene.h"
+#include "Scene/SceneCamera.h"
 #include "Scene/SceneImageEffectLayer.h"
 #include "Scene/SceneNode.h"
+#include "Scene/SceneObject.h"
 #include "SpriteAnimation.hpp"
 #include "SpecTexs.hpp"
 #include "Core/ArrayHelper.hpp"
@@ -56,6 +58,55 @@ Matrix4d ApplyMeshGeometryTransform(const Matrix4d& model, const SceneMesh* mesh
 float SanitizeMouseCoord(double value) {
     if (! std::isfinite(value)) return kDefaultMouseCoord;
     return std::clamp(static_cast<float>(value), 0.0f, 1.0f);
+}
+
+std::array<float, 2> ComposeParallaxLookatWorld(const Scene& scene,
+                                                const WPCameraParallax& parallax,
+                                                const std::array<float, 2>& mouse_input) {
+    Vector2f ortho { (float)scene.ortho[0], (float)scene.ortho[1] };
+    Vector2f mouse_vec =
+        Scaling(1.0f, -1.0f) * (Vector2f { 0.5f, 0.5f } - Vector2f(&mouse_input[0]));
+    mouse_vec = mouse_vec.cwiseProduct(ortho) * parallax.mouseinfluence;
+    Vector2f cam_xy { ortho.x() * 0.5f, ortho.y() * 0.5f };
+    if (scene.activeCamera != nullptr) {
+        const auto cam = scene.activeCamera->GetPosition();
+        cam_xy = Vector2f((float)cam.x(), (float)cam.y());
+    }
+    const Vector2f lookat = cam_xy - mouse_vec;
+    return { lookat.x(), lookat.y() };
+}
+
+void DelayParallaxLookat(std::array<float, 2>& lookat, bool& valid,
+                         const std::array<float, 2>& target, bool snap, double t) {
+    if (snap || ! valid) {
+        lookat = target;
+        valid  = true;
+        return;
+    }
+    lookat = { (float)algorism::lerp(t, lookat[0], target[0]),
+               (float)algorism::lerp(t, lookat[1], target[1]) };
+}
+
+// Official lookat writer (0x140189c90–0x140189cc6) stores
+// clamp(delayed_lookat / ortho, 0..1) at engine+0x9C/+0xA0 after the
+// compose-then-delay lerp. Name-table id 0x6B is g_ParallaxPosition;
+// scene ctor defaults those lanes to 0.5f when camera parallax is off
+// (the writer skips the store). g_PointerPosition stays on delayed NDC
+// mouse. Engine flag 0x800 then does x=1-x; Vivid has no equivalent.
+std::array<float, 2> ComposeParallaxPositionNdc(const Scene& scene,
+                                                const WPCameraParallax& parallax,
+                                                const std::array<float, 2>& lookat,
+                                                bool lookat_valid) {
+    if (! parallax.enable || ! lookat_valid) {
+        return { kDefaultMouseCoord, kDefaultMouseCoord };
+    }
+    const float ortho_w = static_cast<float>(scene.ortho[0]);
+    const float ortho_h = static_cast<float>(scene.ortho[1]);
+    if (!(ortho_w > 0.0f) || !(ortho_h > 0.0f)) {
+        return { kDefaultMouseCoord, kDefaultMouseCoord };
+    }
+    return { std::clamp(lookat[0] / ortho_w, 0.0f, 1.0f),
+             std::clamp(lookat[1] / ortho_h, 0.0f, 1.0f) };
 }
 
 MeshBounds2D ComputeMeshBounds2D(const SceneMesh* mesh) {
@@ -115,10 +166,6 @@ bool IsModelRenderNode(SceneNode* node) {
     return material != nullptr && material->modelRenderState.has_value();
 }
 
-bool IsZeroParallaxDepth(const std::array<float, 2>& depth) {
-    return std::abs(depth[0]) <= 1e-6f && std::abs(depth[1]) <= 1e-6f;
-}
-
 Matrix4d ToD3dClipZViewProjection(const Matrix4d& view_projection) {
     // Vivid Ortho() maps near→NDC z=1 and far→NDC z=0 (GL-like reverse Z after the Vulkan
     // [0,1] remap). Official volumetricsfront.vert FULLSCREEN writes gl_Position.z=0 when
@@ -166,18 +213,13 @@ void PreserveDeferredRuntimeParallaxContract(const WPShaderValueData& old_data,
                                              WPShaderValueData&       new_data,
                                              SceneNode*               old_node,
                                              SceneNode*               new_node) {
-    bool preserved = false;
+    // Official keeps one SceneObject +0x170 across the object's life. Vivid rebuilds the
+    // graph from JSON on materialize, so the placeholder's live depth (JSON or script) has
+    // to land on the replacement the same way origin already does.
+    new_data.parallaxDepth         = old_data.parallaxDepth;
+    new_data.parallaxDepthAuthored = old_data.parallaxDepthAuthored;
 
-    if (IsZeroParallaxDepth(new_data.parallaxDepth) &&
-        ! IsZeroParallaxDepth(old_data.parallaxDepth)) {
-        // Hidden logical placeholders can receive importer-side parallax repairs after the initial
-        // parse, especially compose/effect containers whose authored JSON omits parallaxDepth but
-        // whose descendants must still use the container as a camera-parallax anchor. Runtime
-        // materialization reparses the real layer from JSON, so copy only this repaired parallax
-        // contract when the replacement still has no authored depth of its own.
-        new_data.parallaxDepth = old_data.parallaxDepth;
-        preserved = true;
-    }
+    bool preserved = false;
 
     if (new_data.parallax_anchor == nullptr && old_data.parallax_anchor != nullptr) {
         new_data.parallax_anchor =
@@ -193,9 +235,22 @@ void PreserveDeferredRuntimeParallaxContract(const WPShaderValueData& old_data,
 Matrix4d ComputeEffectTextureProjection(const SceneNode* projectionNode,
                                         const SceneMesh* projectionMesh,
                                         const Matrix4d&  projectionModelTrans,
-                                        const Matrix4d&  viewProjectionTrans) {
-    if (projectionNode == nullptr || projectionMesh == nullptr) return Matrix4d::Identity();
+                                        const Matrix4d&  viewProjectionTrans,
+                                        float authored_width = 0.0f,
+                                        float authored_height = 0.0f) {
+    if (projectionNode == nullptr) return Matrix4d::Identity();
 
+    // Official leftover dest-draw flag0 writes dest*VP*S(w/2) at +0x9b0 (DEST_MVP
+    // 0x1401ec51f). Date last-pass skips +0x9b0 (combo+0x14 bit0 clear). VERTICAL
+    // g_MVP is +0x930 = camera*dest (ENGINE_FLUSH / LASTPASS_CAM_ORTHO /
+    // LASTPASS_DEST_STACK), not this slot. Flag1 / I-slot g_ETVP still takes S
+    // at 0x1401ec338. Dest 3×3 has no +0x2f0 (0x140185150).
+    if (authored_width > 0.0f && authored_height > 0.0f) {
+        const Affine3d scale(Eigen::Scaling(authored_width * 0.5, authored_height * 0.5, 1.0));
+        return viewProjectionTrans * projectionModelTrans * scale.matrix();
+    }
+
+    if (projectionMesh == nullptr) return viewProjectionTrans * projectionModelTrans;
     const auto bounds = ComputeMeshBounds2D(projectionMesh);
     if (!bounds.valid) return viewProjectionTrans * projectionModelTrans;
 
@@ -239,9 +294,21 @@ void WPShaderValueUpdater::PrepareFrame() {
        * 60.0f);
     */
     const std::array<float, 2> previousMousePos = m_mousePos;
+    const auto lookat_target =
+        m_scene != nullptr ? ComposeParallaxLookatWorld(*m_scene, m_parallax, m_mousePosInput)
+                           : m_parallaxLookat;
+    // Official ctor 0x14018870c: ortho rest lookat = [scene+0xf0] + 0.5*ortho, then the
+    // per-frame writer lerps from that stored lookat (0x140189c51). Do not start at (0,0)
+    // and do not snap the first delayed frame to the current target.
+    if (m_scene != nullptr && !m_parallaxLookatValid) {
+        m_parallaxLookat = ComposeParallaxLookatWorld(
+            *m_scene, m_parallax, { kDefaultMouseCoord, kDefaultMouseCoord });
+        m_parallaxLookatValid = true;
+    }
     if (!(m_parallax.delay > 0.0f) || !std::isfinite(m_parallax.delay)) {
         m_mousePosLast     = previousMousePos;
         m_mousePos         = m_mousePosInput;
+        DelayParallaxLookat(m_parallaxLookat, m_parallaxLookatValid, lookat_target, true, 1.0);
         AdvanceAllPuppets();
         return;
     }
@@ -256,10 +323,33 @@ void WPShaderValueUpdater::PrepareFrame() {
     m_mousePosLast     = previousMousePos;
     m_mousePos         = std::array { (float)algorism::lerp(t, m_mousePos[0], m_mousePosInput[0]),
                                       (float)algorism::lerp(t, m_mousePos[1], m_mousePosInput[1]) };
+    DelayParallaxLookat(m_parallaxLookat, m_parallaxLookatValid, lookat_target, false, t);
     AdvanceAllPuppets();
 }
 
+void WPShaderValueUpdater::SetScreenSize(i32 w, i32 h) {
+    m_screen_size = { (float)w, (float)h };
+    // VIEW_ORTHO_LR: last-pass camera uses FULLFB window, not canvas.
+    if (m_scene != nullptr) m_scene->SetWindowSize(w, h);
+}
+
 void WPShaderValueUpdater::FrameBegin() {}
+
+void WPShaderValueUpdater::ComposeDrawWalker() {
+    // PATH_B 0x14018b022 / 0x14018b118 / 0x14018b170 / 0x14018b17a.
+    // Dest-draw still runs when Path B is skipped (LEFTOVER_VS_DESTDRAW).
+    if (m_scene == nullptr) return;
+    for (SceneObject* object : m_scene->objectList) {
+        if (object == nullptr) continue;
+        m_scene->DestStackPushCopy();
+        if (m_parallax.enable) {
+            m_scene->DestStackApplyPathB(*object, m_parallaxLookat[0], m_parallaxLookat[1],
+                                         m_parallax.amount);
+        }
+        object->DestDraw();
+        m_scene->DestStackPop();
+    }
+}
 
 void WPShaderValueUpdater::AdvanceAllPuppets() {
     if (!m_scene) return;
@@ -317,7 +407,7 @@ Matrix4d WPShaderValueUpdater::ResolveModelTransformForProjection(
                                                local_parallax_cache,
                                                local_attachment_cache,
                                                camera,
-                                               m_mousePos,
+                                               m_parallaxLookat,
                                                m_puppet_frame_serial);
 
     if (const auto* node_data = GetNodeData(node); node_data != nullptr) {
@@ -464,7 +554,7 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
                                               use_camera_local_transform_caches
                                                   ? model_parallax_camera
                                                   : m_scene->activeCamera,
-                                              m_mousePos,
+                                              m_parallaxLookat,
                                               m_puppet_frame_serial);
 
     if (exists(m_nodeDataMap, pNode)) {
@@ -481,10 +571,17 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             }
 
             if (effectLayer != nullptr) {
-                if (auto* worldNode = effectLayer->WorldNode()) {
-                    worldNode->SetLocalAffine(*localTransform);
-                    worldNode->UpdateTrans();
-                    effectLayer->SyncResolvedNodeToWorld();
+                if (auto* layer_node = effectLayer->LayerNode()) {
+                    layer_node->SetLocalAffine(*localTransform);
+                    layer_node->UpdateTrans();
+                    // Official dest-draw last-pass T is dest-STACK, not a
+                    // second FinalNode dest copy of this layer node.
+                    const auto* object = m_scene != nullptr
+                        ? m_scene->FindSceneObjectForNode(layer_node)
+                        : nullptr;
+                    if (object == nullptr || !object->DestDrawPublishesDefault()) {
+                        effectLayer->SyncResolvedNodeToWorld();
+                    }
                 }
             } else {
                 pNode->SetLocalAffine(*localTransform);
@@ -498,39 +595,31 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         auto camera_it = m_scene->cameras.find(std::string(node_cam_name));
         if (camera_it != m_scene->cameras.end() && camera_it->second->HasImgEffect()) {
             auto* effectLayer = camera_it->second->GetImgEffect().get();
-            auto* worldNode   = effectLayer->WorldNode();
-            if (worldNode != nullptr && exists(m_nodeDataMap, worldNode)) {
-                auto& worldNodeData = m_nodeDataMap.at(worldNode);
-                transformResolver.UpdateAttachmentParentIfNeeded(worldNodeData);
-                if (worldNodeData.IsBoneAttached()) {
-                    // Effect-backed layers draw their source into a private camera, then composite a
-                    // detached final node back into the visible scene. When a deferred hidden layer is
-                    // later promoted to a real bone attachment, the visible world node no longer gets a
-                    // normal SceneNode tree update that would carry the puppet bone and inherited
-                    // parallax into that final writer. Resolve the attachment here before syncing the
-                    // effect output matrix so runtime-revealed puppet parts keep the same camera
-                    // parallax as layers that were visible at parse time.
-                    auto localTransform = transformResolver.ResolveAttachmentLocalTransform(worldNode);
+            auto* layer_node  = effectLayer->LayerNode();
+            if (layer_node != nullptr && exists(m_nodeDataMap, layer_node)) {
+                auto& layer_node_data = m_nodeDataMap.at(layer_node);
+                transformResolver.UpdateAttachmentParentIfNeeded(layer_node_data);
+                if (layer_node_data.IsBoneAttached()) {
+                    auto localTransform =
+                        transformResolver.ResolveAttachmentLocalTransform(layer_node);
                     if (localTransform.has_value()) {
-                        worldNode->SetLocalAffine(*localTransform);
-                        worldNode->UpdateTrans();
+                        layer_node->SetLocalAffine(*localTransform);
+                        layer_node->UpdateTrans();
                     }
                 }
-                if (worldNodeData.InheritsSceneParentTransform() || worldNodeData.IsBoneAttached()) {
+                const auto* object = m_scene != nullptr
+                    ? m_scene->FindSceneObjectForNode(layer_node)
+                    : nullptr;
+                if ((object == nullptr || !object->DestDrawPublishesDefault()) &&
+                    (layer_node_data.InheritsSceneParentTransform() ||
+                     layer_node_data.IsBoneAttached())) {
                     const SceneCamera* displayCamera =
                         m_scene->activeCamera != nullptr ? m_scene->activeCamera : camera;
-                    // Composition source routes publish a child layer's private authored effect
-                    // through the neutral final composite. Keep that publisher on the raw routed
-                    // world transform here; the actual compose-source pass applies the chosen
-                    // source camera and camera-parallax exactly once. Syncing it to the active
-                    // screen camera here would bake one parallax offset into the node transform,
-                    // then the compose pass would add another one, which pulls effect-backed body
-                    // parts away from direct siblings such as faces and eyes.
                     const auto worldModel =
                         effectLayer->PublishesPrivateFinalComposite()
-                            ? transformResolver.ResolveRawModelTransform(worldNode)
+                            ? transformResolver.ResolveRawModelTransform(layer_node)
                             : transformResolver.ResolveParallaxedModelTransform(
-                                  worldNode, displayCamera, displayCamera != nullptr);
+                                  layer_node, displayCamera, displayCamera != nullptr);
                     effectLayer->SyncResolvedNodeToMatrix(Affine3f(worldModel.cast<float>()));
                 }
             }
@@ -612,31 +701,27 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     }
     if (reqM || reqAM || reqMVP || reqLMM || reqEMVP || reqMI || reqMVPI || reqETVP ||
         reqETVPI) {
-        Matrix4d modelTrans =
-            transformResolver.ResolveParallaxedModelTransform(
-                pNode, model_parallax_camera, uniform_cam_name != "effect");
-        if (use_active_parallax_camera) {
-            const auto source_camera_node = camera->GetAttachedNode();
-            const auto source_camera_data =
-                source_camera_node != nullptr && exists(m_nodeDataMap, source_camera_node.get())
-                    ? &m_nodeDataMap.at(source_camera_node.get())
-                    : nullptr;
-            if (source_camera_data != nullptr && source_camera_data->AppliesModelParallax()) {
-                // Composition-source routes project a child through the source camera, then the
-                // parent composition layer publishes that source texture through its own final
-                // scene-space writer. The child model therefore needs active-camera parallax minus
-                // the parallax already represented by the source camera's attached layer; otherwise
-                // parent depth is added twice for authored parallax groups, while source-camera
-                // relative parallax drops the root fallback movement for groups whose final writer
-                // deliberately suppresses its own model parallax.
-                const auto source_parallax =
-                    transformResolver.ResolveParallaxOffset(source_camera_node.get(),
-                                                            model_parallax_camera);
-                modelTrans =
-                    Affine3d(Eigen::Translation3d((-source_parallax).cast<double>())).matrix() *
-                    modelTrans;
-            }
-        }
+        // Official 0x1401ec799 writes I into [engine+0x30] only when +0x304 bit5
+        // is clear (0x1401ec781 test; bit5 → 0x1401ec878 copies dest from rdi).
+        // Dest blit after I pop is 0x1401e9dd5 / 0x1401e9cf9. Image draw
+        // 0x1401e8f6f skips `_rt_FullFrameBuffer` for a passthrough parent and
+        // then still loads scene+0x40/+0x38/+0x30 dest (0x1401e9029). The pass
+        // sets use_identity_model for I-internal; a compose-source camera
+        // override is dest, even though that camera HasImgEffect().
+        const bool pass_requests_i =
+            overrides != nullptr && overrides->use_identity_model;
+        const bool pass_requests_dest =
+            overrides != nullptr && overrides->use_camera_override &&
+            ! overrides->use_identity_model;
+        const bool official_i_slot =
+            pass_requests_i ||
+            uniform_cam_name == "effect" ||
+            (camera != nullptr && camera->HasImgEffect() &&
+             ! use_active_camera_for_uniforms && ! pass_requests_dest);
+        Matrix4d modelTrans = official_i_slot
+            ? Matrix4d::Identity()
+            : transformResolver.ResolveParallaxedModelTransform(
+                pNode, model_parallax_camera, true);
 
         modelTrans = ApplyMeshGeometryTransform(modelTrans, pNode->Mesh());
 
@@ -646,6 +731,42 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
         if (reqMI) updateOp(G_MI, ToDxcCBufferMatrixUniform(modelTrans.inverse()));
         if (reqMVP || reqEMVP) {
             Matrix4d mvpTrans = viewProTrans * modelTrans;
+            if (! official_i_slot) {
+                // Dest-draw leftover g_MVP is dest-ortho * I (DEST_ORTHO_TNF).
+                // Last-pass g_MVP is +0x930 fit-ortho * dest-STACK
+                // (LIVE_LASTPASS_930). Both are Record writes, not this shared
+                // UpdateUniforms path (LEFTOVER_VS_DESTDRAW). DEST_MVP +0x9b0
+                // leftover scale is not g_MVP. Only the +0x2e0 ±1 card takes
+                // this leftover scale. A ±size/2 mesh is already sized.
+                float dest_w = 0.0f;
+                float dest_h = 0.0f;
+                if (hasNodeData) {
+                    dest_w = m_nodeDataMap.at(pNode).effect_texture_projection.width;
+                    dest_h = m_nodeDataMap.at(pNode).effect_texture_projection.height;
+                }
+                if ((!(dest_w > 0.0f) || !(dest_h > 0.0f)) && m_scene != nullptr) {
+                    const auto owner = m_scene->nodeOwners.find(pNode);
+                    if (owner != m_scene->nodeOwners.end()) {
+                        const auto image = m_scene->imageLayers.find(owner->second);
+                        if (image != m_scene->imageLayers.end()) {
+                            dest_w = image->second.size[0];
+                            dest_h = image->second.size[1];
+                        }
+                    }
+                }
+                const auto bounds = ComputeMeshBounds2D(pNode->Mesh());
+                const bool unit_card =
+                    bounds.valid && std::abs(bounds.halfExtent.x() - 1.0) < 0.05 &&
+                    std::abs(bounds.halfExtent.y() - 1.0) < 0.05;
+                if (unit_card && dest_w > 0.0f && dest_h > 0.0f) {
+                    mvpTrans = mvpTrans *
+                               Affine3d(Eigen::Scaling(
+                                            static_cast<double>(dest_w) * 0.5,
+                                            static_cast<double>(dest_h) * 0.5,
+                                            1.0))
+                                   .matrix();
+                }
+            }
             if (reqMVP) updateOp(G_MVP, ToDxcCBufferMatrixUniform(mvpTrans));
             if (reqEMVP) updateOp(G_EMVP, ToDxcCBufferMatrixUniform(mvpTrans));
             if (reqMVPI) updateOp(G_MVPI, ToDxcCBufferMatrixUniform(mvpTrans.inverse()));
@@ -657,6 +778,12 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             Matrix4d         projectionViewPro    = viewProTrans;
 
             const WPShaderValueData* nodeDataPtr = hasNodeData ? &m_nodeDataMap.at(pNode) : nullptr;
+            float etvp_w = 0.0f;
+            float etvp_h = 0.0f;
+            if (nodeDataPtr != nullptr) {
+                etvp_w = nodeDataPtr->effect_texture_projection.width;
+                etvp_h = nodeDataPtr->effect_texture_projection.height;
+            }
             if (nodeDataPtr != nullptr &&
                 nodeDataPtr->effect_texture_projection.node != nullptr &&
                 nodeDataPtr->effect_texture_projection.mesh != nullptr &&
@@ -672,7 +799,9 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
             const auto etvpTrans = ComputeEffectTextureProjection(projectionNode,
                                                                   projectionMesh,
                                                                   projectionModelTrans,
-                                                                  projectionViewPro);
+                                                                  projectionViewPro,
+                                                                  etvp_w,
+                                                                  etvp_h);
             if (reqETVP) updateOp(G_ETVP, ToDxcCBufferMatrixUniform(etvpTrans));
             if (reqETVPI) {
                 if (std::abs(etvpTrans.determinant()) > 1e-12) {
@@ -801,13 +930,9 @@ void WPShaderValueUpdater::UpdateUniforms(SceneNode* pNode, sprite_map_t& sprite
     }
 
     if (info.has_PARALLAXPOSITION) {
-        Vector2f para { 0.5f, 0.5f };
-        if (m_parallax.enable) {
-            const Vector2f mouseCentered = Vector2f(&m_mousePos[0]) - Vector2f { 0.5f, 0.5f };
-            para = Vector2f { 0.5f, 0.5f } +
-                   (Scaling(1.0f, -1.0f) * mouseCentered) * m_parallax.mouseinfluence;
-        }
-        updateOp(G_PARALLAXPOSITION, std::array { para[0], para[1] });
+        const auto para = ComposeParallaxPositionNdc(*m_scene, m_parallax, m_parallaxLookat,
+                                                     m_parallaxLookatValid);
+        updateOp(G_PARALLAXPOSITION, para);
     }
 
     for (size_t index = 0; index < kAudioSpectrumResolutions.size(); index++) {

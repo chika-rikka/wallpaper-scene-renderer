@@ -20,19 +20,23 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
+#include <string>
+#include <vector>
 
 using namespace wallpaper::vulkan;
 
 std::string wallpaper::vulkan::ShaderDrawPipelineCompatibilityKey(
     VkAttachmentLoadOp load_op, bool model_pass, VkAttachmentLoadOp depth_load_op,
     const ShaderDrawAttachmentDescription& attachment, VkSampleCountFlagBits samples,
-    bool resolve_msaa) {
+    bool resolve_msaa, VkImageLayout color_initial_layout) {
     // Keep this key limited to Vulkan render-pass compatibility. GraphicsPipeline adds the shader,
     // descriptor, vertex-input, blend, depth, and topology state to the final cache key, matching
     // the descriptor-driven PSO caches used by larger renderers instead of tying immutable PSOs to
     // a transient layer/pass identity.
-    return "ShaderDraw|format=rgba8|final=shader-read|load=" +
+    return "ShaderDraw|format=rgba8|final=shader-read|store-vis=1|load=" +
            std::to_string(static_cast<int>(load_op)) +
+           "|init=" + std::to_string(static_cast<int>(color_initial_layout)) +
            "|model=" + (model_pass ? std::string("1") : std::string("0")) +
            "|depth-format=d32|depth-load=" + std::to_string(static_cast<int>(depth_load_op)) +
            "|extra-tag=" + std::string(attachment.cache_tag) +
@@ -75,6 +79,21 @@ VkPrimitiveTopology ToTopology(const wallpaper::SceneMesh& mesh) {
     }
     assert(false);
     return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+}
+
+// TEXT_E0_IDEST 0x1401e9681 / POSTFX_OMSET 0x1401ebf8c OMSet leftover /
+// FullCompo as the color target before type-0 Draw. TREE dest-draw
+// leftover and HORIZONTAL are Normal → DONT_CARE. Official D3D11 OMSet
+// is a color attachment; Vulkan analog is COLOR_ATTACHMENT at
+// BeginRenderPass, not UNDEFINED after a SHADER_READ bootstrap clear.
+VkImageLayout DestDrawOmsetInitialLayout(const wallpaper::vulkan::ShaderDrawData& desc,
+                                         VkAttachmentLoadOp load_op) {
+    if (load_op == VK_ATTACHMENT_LOAD_OP_DONT_CARE &&
+        (desc.dest_draw_phase == wallpaper::DestDrawPhase::Leftover ||
+         desc.dest_draw_phase == wallpaper::DestDrawPhase::PostFx)) {
+        return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
+    return VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
 std::optional<VmaImageParameters> CreateModelDepthImage(const Device& device, VkExtent3D extent,
@@ -149,6 +168,12 @@ ShaderDrawCore::ShaderDrawCore(const ShaderDrawRequest& desc) {
     m_desc.camera_override     = desc.camera_override;
     m_desc.use_active_camera_for_uniforms = desc.use_active_camera_for_uniforms;
     m_desc.use_active_camera_for_parallax = desc.use_active_camera_for_parallax;
+    m_desc.use_identity_model  = desc.use_identity_model;
+    // LEFTOVER_VS_DESTDRAW / PATH_B 0x14018b170: leftover then last-pass are
+    // dest-draw phases on one object. IndexDestDrawPass reads destDrawPhase()
+    // after construction; dropping this field left every CustomShaderPass and
+    // MaskedMeshPass at DestDrawPhase::None.
+    m_desc.dest_draw_phase     = desc.dest_draw_phase;
     m_desc.sprites_map         = desc.sprites_map;
     m_desc.model_pass          = desc.model_pass;
     m_desc.depth_test          = desc.depth_test;
@@ -201,6 +226,8 @@ bool ShaderDrawCore::canReuseForResidency(const ShaderDrawCore& next) const {
                next.m_desc.use_active_camera_for_uniforms &&
            m_desc.use_active_camera_for_parallax ==
                next.m_desc.use_active_camera_for_parallax &&
+           m_desc.use_identity_model == next.m_desc.use_identity_model &&
+           m_desc.dest_draw_phase == next.m_desc.dest_draw_phase &&
            this_samples == next_samples &&
            ! m_desc.resolve_msaa &&
            m_desc.textures.size() == next.m_desc.textures.size();
@@ -222,6 +249,8 @@ void ShaderDrawCore::absorbResidencyGraphState(const ShaderDrawCore& next) {
     m_desc.camera_override = next.m_desc.camera_override;
     m_desc.use_active_camera_for_uniforms = next.m_desc.use_active_camera_for_uniforms;
     m_desc.use_active_camera_for_parallax = next.m_desc.use_active_camera_for_parallax;
+    m_desc.use_identity_model = next.m_desc.use_identity_model;
+    m_desc.dest_draw_phase = next.m_desc.dest_draw_phase;
     m_desc.sprites_map    = next.m_desc.sprites_map;
 }
 
@@ -248,7 +277,7 @@ bool ShaderDrawCore::referencesImportedTexture(std::string_view texture_key) con
 std::optional<vvk::RenderPass> wallpaper::vulkan::CreateShaderDrawRenderPass(
     const vvk::Device& device, VkFormat format, VkAttachmentLoadOp loadOp,
     VkImageLayout finalLayout, const ShaderDrawAttachmentDescription& extra_attachment,
-    VkSampleCountFlagBits samples, bool resolve_msaa) {
+    VkSampleCountFlagBits samples, bool resolve_msaa, VkImageLayout color_initial_layout) {
     const bool store_ms = samples > VK_SAMPLE_COUNT_1_BIT;
     const bool msaa     = store_ms && resolve_msaa;
     const VkSampleCountFlagBits color_samples =
@@ -261,11 +290,12 @@ std::optional<vvk::RenderPass> wallpaper::vulkan::CreateShaderDrawRenderPass(
         .storeOp        = VK_ATTACHMENT_STORE_OP_STORE,
         .stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
         .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-        .initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED,
+        .initialLayout  = color_initial_layout,
         .finalLayout    = store_ms ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : finalLayout,
     };
 
-    if (loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
+    if (loadOp == VK_ATTACHMENT_LOAD_OP_LOAD &&
+        color_initial_layout == VK_IMAGE_LAYOUT_UNDEFINED) {
         attachment.initialLayout = store_ms ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
                                             : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
@@ -320,18 +350,34 @@ std::optional<vvk::RenderPass> wallpaper::vulkan::CreateShaderDrawRenderPass(
         .pDepthStencilAttachment = extra_attachment.enabled() ? &depth_attachment_ref : nullptr,
     };
 
-    VkSubpassDependency dependency {
-        .srcSubpass = VK_SUBPASS_EXTERNAL,
-        .dstSubpass = 0,
-        .srcStageMask =
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-        .dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-        .srcAccessMask = {},
-        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+    // TEXT_E0_IDEST 0x1401e968a leftover named-RT store, then
+    // POSTFX_OMSET HORIZONTAL samples that RT. IMAGE_VT_E8 leftover
+    // Draw +0x2d8 then the next dest-draw pass samples it. Official
+    // D3D11 implicit hazard. Implicit Vulkan EXTERNAL→BOTTOM_OF_PIPE
+    // leaves COLOR_ATTACHMENT_WRITE invisible to FRAGMENT_SHADER, so
+    // HORIZONTAL/VERTICAL can sample uninit white.
+    std::array<VkSubpassDependency, 2> dependencies {
+        VkSubpassDependency {
+            .srcSubpass = VK_SUBPASS_EXTERNAL,
+            .dstSubpass = 0,
+            .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+            .srcAccessMask = {},
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        },
+        VkSubpassDependency {
+            .srcSubpass = 0,
+            .dstSubpass = VK_SUBPASS_EXTERNAL,
+            .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        },
     };
 
     uint32_t attachment_count = 1;
@@ -344,8 +390,8 @@ std::optional<vvk::RenderPass> wallpaper::vulkan::CreateShaderDrawRenderPass(
         .pAttachments    = attachments.data(),
         .subpassCount    = 1,
         .pSubpasses      = &subpass,
-        .dependencyCount = 1,
-        .pDependencies   = &dependency,
+        .dependencyCount = static_cast<uint32_t>(dependencies.size()),
+        .pDependencies   = dependencies.data(),
     };
     vvk::RenderPass pass;
     if (auto res = device.CreateRenderPass(creatinfo, pass); res == VK_SUCCESS) {
@@ -548,24 +594,6 @@ void ApplyAlphaWritePolicy(wallpaper::AlphaWritePolicy                policy,
     blend_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
 }
 
-void ApplyPremultipliedSourceBlend(
-    const wallpaper::vulkan::ShaderDrawData& desc,
-    bool                                             writes_alpha,
-    VkPipelineColorBlendAttachmentState&             blend_state) {
-    if (! desc.premultiplied_source_blend || ! blend_state.blendEnable) return;
-
-    // The private layer-surface puppet pass has already composited straight-alpha texture samples
-    // into a transparent render target. Its sampled RGB is premultiplied, while alpha remains the
-    // correct source-over coverage. Keep the authored destination factor from the material blend
-    // mode, but consume RGB as premultiplied color so the final publisher does not fade animated
-    // eye/eyelid pixels before the puppet mesh actually covers them.
-    blend_state.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-    if (writes_alpha) {
-        blend_state.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        blend_state.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    }
-}
-
 void ApplyModelPassDesc(const wallpaper::SceneMaterial&            material,
                         wallpaper::vulkan::ShaderDrawData& desc,
                         VkAttachmentLoadOp&                        load_op) {
@@ -652,7 +680,9 @@ ShaderDrawRenderState BuildCustomShaderRenderState(
 
     const auto blend_mode = material.blenmode;
     SetBlend(blend_mode, state.color_blend);
-    ApplyPremultipliedSourceBlend(desc, writes_alpha, state.color_blend);
+    // Official dest blend is material +0x1f0 → D3D cases in GFX_BLEND_DESC
+    // (0x14009a0fa / 0x14009a32b / 0x14009a2fe). Premul ONE/INV_SRC_ALPHA is
+    // gfx+0x28 bit7 (0x14009a12f); that bit stays ctor 0 (0x140098ed7).
     ApplyAlphaWritePolicy(desc.alpha_write_policy, writes_alpha, state.color_blend);
     desc.blending = state.color_blend.blendEnable;
 
@@ -664,6 +694,91 @@ ShaderDrawRenderState BuildCustomShaderRenderState(
         // Compose shaders usually omit alpha. DONT_CARE would drop the opaque
         // MSAA clear and leave uncovered samples at A=0.
         state.color_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+    }
+    if (desc.dest_draw_phase != wallpaper::DestDrawPhase::None) {
+        LOG_INFO("DestDrawPipelineContract: layer=%d node='%s' material='%s' phase=%d "
+                 "output='%s' blend-mode=%d blend-enable=%d "
+                 "color-factors=[%d %d] alpha-factors=[%d %d] load=%d mask=0x%x",
+                 desc.layer_id,
+                 desc.node != nullptr ? desc.node->Name().c_str() : "",
+                 material.name.c_str(),
+                 static_cast<int>(desc.dest_draw_phase),
+                 desc.output.c_str(),
+                 static_cast<int>(blend_mode),
+                 state.color_blend.blendEnable ? 1 : 0,
+                 static_cast<int>(state.color_blend.srcColorBlendFactor),
+                 static_cast<int>(state.color_blend.dstColorBlendFactor),
+                 static_cast<int>(state.color_blend.srcAlphaBlendFactor),
+                 static_cast<int>(state.color_blend.dstAlphaBlendFactor),
+                 static_cast<int>(state.color_load_op),
+                 static_cast<unsigned int>(state.color_blend.colorWriteMask));
+        // A dest-draw effect can have correct geometry and blend state while still exposing a
+        // hard card boundary when one of its small authored masks or private render targets is
+        // sampled with the wrong resolution/filter contract. Report the scene-side descriptor
+        // inputs next to the pipeline contract so the source of such a boundary is observable
+        // without adding project- or layer-specific branches to the renderer.
+        if (desc.scene != nullptr) {
+            for (size_t slot = 0; slot < desc.textures.size(); ++slot) {
+                const auto& texture_name = desc.textures[slot];
+                const auto  rt_it = desc.scene->renderTargets.find(texture_name);
+                if (rt_it != desc.scene->renderTargets.end()) {
+                    const auto& sample = rt_it->second.sample;
+                    const auto  resolution = rt_it->second.ResolutionVector();
+                    LOG_INFO("DestDrawTextureContract: layer=%d phase=%d slot=%zu "
+                             "texture='%s' source=render-target resolution=[%d %d %d %d] "
+                             "sampler=[%.*s %.*s %.*s %.*s]",
+                             desc.layer_id,
+                             static_cast<int>(desc.dest_draw_phase),
+                             slot,
+                             texture_name.c_str(),
+                             resolution[0],
+                             resolution[1],
+                             resolution[2],
+                             resolution[3],
+                             static_cast<int>(wallpaper::TextureWrapName(sample.wrapS).size()),
+                             wallpaper::TextureWrapName(sample.wrapS).data(),
+                             static_cast<int>(wallpaper::TextureWrapName(sample.wrapT).size()),
+                             wallpaper::TextureWrapName(sample.wrapT).data(),
+                             static_cast<int>(wallpaper::TextureFilterName(sample.magFilter).size()),
+                             wallpaper::TextureFilterName(sample.magFilter).data(),
+                             static_cast<int>(wallpaper::TextureFilterName(sample.minFilter).size()),
+                             wallpaper::TextureFilterName(sample.minFilter).data());
+                    continue;
+                }
+                const auto texture_it = desc.scene->textures.find(texture_name);
+                if (texture_it == desc.scene->textures.end()) {
+                    LOG_INFO("DestDrawTextureContract: layer=%d phase=%d slot=%zu "
+                             "texture='%s' source=missing",
+                             desc.layer_id,
+                             static_cast<int>(desc.dest_draw_phase),
+                             slot,
+                             texture_name.c_str());
+                    continue;
+                }
+                const auto& sample = texture_it->second.sample;
+                const auto resolution =
+                    desc.scene->EffectiveImportedTextureResolution(texture_it->second);
+                LOG_INFO("DestDrawTextureContract: layer=%d phase=%d slot=%zu texture='%s' "
+                         "source=imported resolution=[%d %d %d %d] "
+                         "sampler=[%.*s %.*s %.*s %.*s]",
+                         desc.layer_id,
+                         static_cast<int>(desc.dest_draw_phase),
+                         slot,
+                         texture_name.c_str(),
+                         resolution[0],
+                         resolution[1],
+                         resolution[2],
+                         resolution[3],
+                         static_cast<int>(wallpaper::TextureWrapName(sample.wrapS).size()),
+                         wallpaper::TextureWrapName(sample.wrapS).data(),
+                         static_cast<int>(wallpaper::TextureWrapName(sample.wrapT).size()),
+                         wallpaper::TextureWrapName(sample.wrapT).data(),
+                         static_cast<int>(wallpaper::TextureFilterName(sample.magFilter).size()),
+                         wallpaper::TextureFilterName(sample.magFilter).data(),
+                         static_cast<int>(wallpaper::TextureFilterName(sample.minFilter).size()),
+                         wallpaper::TextureFilterName(sample.minFilter).data());
+            }
+        }
     }
     return state;
 }
@@ -746,6 +861,15 @@ bool RefreshCustomShaderPassTextures(wallpaper::Scene& scene, const Device& devi
             auto& rt  = render_target_it->second;
             auto  opt = device.tex_cache().Query(
                 tex_name, wallpaper::vulkan::ToTexKey(rt), ! rt.allowReuse);
+            if ((desc.layer_id == 248 || desc.layer_id == 242) && i == 0) {
+                LOG_INFO("DestDrawDateTex0: id=%d phase=%d tex='%s' rt=%dx%d ok=%d",
+                         desc.layer_id,
+                         static_cast<int>(desc.dest_draw_phase),
+                         tex_name.c_str(),
+                         rt.width,
+                         rt.height,
+                         opt.has_value() ? 1 : 0);
+            }
             if (! opt.has_value()) {
                 LOG_ERROR("CustomShaderPassRefresh: query input failed node='%s' output='%s' "
                           "slot=%zu texture='%s'",
@@ -1107,6 +1231,19 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
     std::vector<VkVertexInputAttributeDescription> attr_descriptions;
     {
         m_desc.dyn_vertex = mesh.Dynamic();
+        if (m_desc.dest_draw_phase == wallpaper::DestDrawPhase::Leftover ||
+            m_desc.dest_draw_phase == wallpaper::DestDrawPhase::PostFx ||
+            m_desc.dest_draw_phase == wallpaper::DestDrawPhase::LastPass) {
+            // IMAGE_2D8_NOFULLFB 0x1401eb180 / IMAGE_VT_E8 0x140208067:
+            // leftover +0x2d8 is the flags=0 0..AABB object card.
+            // POSTFX_MESH 0x1401ea151 / 0x1401ede30: HORIZONTAL +0x2e0
+            // ±1 and VERTICAL +0x2e8 ±half AABB are the same class of
+            // vt+0xb0 cards, not TEXT_LAYOUT_VERTS Dirty glyphs.
+            // ChangeMeshDataFrom onto an image/text-effect node leaves
+            // SceneMesh::Dynamic() true and would put those verts on
+            // dyn_buf with leftover TextPass glyphs/UBOs.
+            m_desc.dyn_vertex = false;
+        }
         // Dynamic meshes allocate fresh staging/GPU subranges every time the render graph is
         // recompiled. A static-looking text layer can therefore become "clean" long before a new
         // pass instance is created, which leaves the newly allocated buffer ranges uninitialized if
@@ -1180,13 +1317,16 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
     const auto render_state = BuildCustomShaderRenderState(*mesh.Material(), m_desc);
     {
         const auto attachment = ResolveShaderDrawAttachment(m_desc, m_extension);
+        const auto color_initial =
+            DestDrawOmsetInitialLayout(m_desc, render_state.color_load_op);
         auto opt = CreateShaderDrawRenderPass(device.handle(),
                                               VK_FORMAT_R8G8B8A8_UNORM,
                                               render_state.color_load_op,
                                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                               attachment,
                                               m_desc.sample_count,
-                                              m_desc.resolve_msaa);
+                                              m_desc.resolve_msaa,
+                                              color_initial);
         if (! opt.has_value()) return false;
         auto& pass = opt.value();
 
@@ -1214,7 +1354,8 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
             m_desc.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
             attachment,
             m_desc.sample_count,
-            m_desc.resolve_msaa);
+            m_desc.resolve_msaa,
+            color_initial);
         if (! pipeline.create(device, pass, m_desc.pipeline, rr.pipeline_cache.get())) return false;
 
         if (m_extension != nullptr &&
@@ -1421,12 +1562,16 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
         // updateBeforeUpload(): every CPU write that feeds the current draw must happen before
         // VulkanRender records and flushes m_dyn_buf->recordUpload().
         m_desc.update_dynamic_mesh_op = update_dyn_buf_op;
+        m_ubo_block   = block;
+        m_ubo_staging = buf;
+        m_ubo_ready   = true;
         m_desc.update_op =
             [shader_updater, block, buf, bufref, extension,
              node, material, &sprites, &vk_textures,
              camera_override = m_desc.camera_override,
              use_active_camera_for_uniforms = m_desc.use_active_camera_for_uniforms,
-             use_active_camera_for_parallax = m_desc.use_active_camera_for_parallax]() {
+             use_active_camera_for_parallax = m_desc.use_active_camera_for_parallax,
+             use_identity_model = m_desc.use_identity_model]() {
                 auto update_unf_op = [block, buf, bufref, extension](
                                          std::string_view name, wallpaper::ShaderValue value) {
                     UpdateShaderDrawUniform(buf, *bufref, block, name, value);
@@ -1440,13 +1585,15 @@ bool ShaderDrawCore::prepare(Scene& scene, const Device& device, RenderingResour
                     .use_camera_override = !camera_override.empty(),
                     .use_active_camera_for_uniforms = use_active_camera_for_uniforms,
                     .use_active_camera_for_parallax = use_active_camera_for_parallax,
+                    .use_identity_model = use_identity_model,
                 };
                 shader_updater->UpdateUniforms(
                     node,
                     sprites,
                     update_unf_op,
                     (overrides.use_camera_override ||
-                     overrides.use_active_camera_for_uniforms)
+                     overrides.use_active_camera_for_uniforms ||
+                     overrides.use_identity_model)
                         ? &overrides
                         : nullptr);
                 // update image slot for sprites
@@ -1627,13 +1774,16 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
     }
     auto render_state = BuildCustomShaderRenderState(*mesh.Material(), m_desc);
     const auto attachment = ResolveShaderDrawAttachment(m_desc, m_extension);
+    const auto color_initial =
+        DestDrawOmsetInitialLayout(m_desc, render_state.color_load_op);
     auto opt = CreateShaderDrawRenderPass(device.handle(),
                                           VK_FORMAT_R8G8B8A8_UNORM,
                                           render_state.color_load_op,
                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                           attachment,
                                           m_desc.sample_count,
-                                          m_desc.resolve_msaa);
+                                          m_desc.resolve_msaa,
+                                          color_initial);
     if (! opt.has_value()) return false;
     auto& pass = opt.value();
 
@@ -1654,7 +1804,8 @@ bool ShaderDrawCore::warmupPipeline(Scene& scene, const Device& device, Renderin
         m_desc.clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
         attachment,
         m_desc.sample_count,
-        m_desc.resolve_msaa);
+        m_desc.resolve_msaa,
+        color_initial);
     pipeline.addDescriptorSetInfo(spanone { descriptor_info })
         .setColorBlendStates(spanone { render_state.color_blend })
         .setTopology(ToTopology(mesh))
@@ -1677,7 +1828,19 @@ bool ShaderDrawCore::refreshResources(Scene& scene, const Device& device,
     // in the scene when the clock/date text changes shape.
     if (m_desc.node != nullptr && m_desc.node->Mesh() != nullptr) {
         auto& mesh = *m_desc.node->Mesh();
-        if (! mesh.Dynamic() && mesh.Dirty().load()) {
+        // POSTFX_MESH 0x1401ea151 / TEXT_2F0 0x1402589da: dest-draw
+        // HORIZONTAL +0x2e0 and VERTICAL +0x2e8 are object cards. TREE
+        // ChangeMeshDataFrom onto a text-effect node leaves
+        // SceneMesh::Dynamic() true, but dest-draw prepare stores those
+        // verts on vertex_buf (not dyn_buf). Dirty last-pass AABB growth
+        // must re-prepare that card; mesh.Dynamic() alone would skip it
+        // and leave GPU verts on the parse-time 846 card (±423).
+        const bool dest_draw_object_card =
+            ! m_desc.dyn_vertex &&
+            (m_desc.dest_draw_phase == wallpaper::DestDrawPhase::Leftover ||
+             m_desc.dest_draw_phase == wallpaper::DestDrawPhase::PostFx ||
+             m_desc.dest_draw_phase == wallpaper::DestDrawPhase::LastPass);
+        if ((! mesh.Dynamic() || dest_draw_object_card) && mesh.Dirty().load()) {
             // Resource-only refreshes were originally written for effects whose geometry never
             // changes after graph build. Refactored text effects break that assumption: runtime
             // updates now mutate the static blur/compose quads of already-compiled effect passes.
@@ -1813,11 +1976,219 @@ void ShaderDrawCore::updateBeforeUpload() {
     if (m_desc.update_dynamic_mesh_op) m_desc.update_dynamic_mesh_op();
 }
 
+void ShaderDrawCore::WriteUniform(std::string_view name, const ShaderValue& value) {
+    // VERTICAL_MVP_ID 0x1400d8676 copies +0x930 into g_MVP after ENGINE_FLUSH.
+    if (! m_ubo_ready || m_ubo_staging == nullptr) return;
+    UpdateShaderDrawUniform(m_ubo_staging, m_desc.ubo_buf, m_ubo_block, name, value);
+}
+
+bool ShaderDrawCore::HasUniform(std::string_view name) const {
+    return wallpaper::exists(m_ubo_block.member_map, name);
+}
+
 void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
+    const bool leftover_417 =
+        m_desc.layer_id == 417 && m_desc.dest_draw_phase == DestDrawPhase::Leftover;
+    const bool leftover_date =
+        (m_desc.layer_id == 248 || m_desc.layer_id == 242) &&
+        m_desc.dest_draw_phase == DestDrawPhase::Leftover;
+    const bool leftover_image =
+        (m_desc.layer_id == 1175 || m_desc.layer_id == 173 || m_desc.layer_id == 751 ||
+         m_desc.layer_id == 4350) &&
+        m_desc.dest_draw_phase == DestDrawPhase::Leftover;
+    const bool date_dest =
+        ((m_desc.layer_id == 248 || m_desc.layer_id == 242) &&
+         m_desc.dest_draw_phase != DestDrawPhase::None) ||
+        leftover_image;
+    auto log_date_dest = [&](const char* skip) {
+        if (!date_dest) return;
+        float min_x = 0.0f;
+        float max_x = 0.0f;
+        float min_y = 0.0f;
+        float max_y = 0.0f;
+        uint32_t verts = 0;
+        if (m_desc.node != nullptr && m_desc.node->Mesh() != nullptr &&
+            m_desc.node->Mesh()->VertexCount() > 0) {
+            const auto& va = m_desc.node->Mesh()->GetVertexArray(0);
+            const float* data = va.Data();
+            verts = static_cast<uint32_t>(va.VertexCount());
+            if (data != nullptr && va.VertexCount() > 0 && va.OneSize() >= 2) {
+                min_x = max_x = data[0];
+                min_y = max_y = data[1];
+                for (uint32_t i = 1; i < va.VertexCount(); ++i) {
+                    const float* p = data + i * va.OneSize();
+                    min_x = std::min(min_x, p[0]);
+                    max_x = std::max(max_x, p[0]);
+                    min_y = std::min(min_y, p[1]);
+                    max_y = std::max(max_y, p[1]);
+                }
+            }
+        }
+        void* tex0_view = nullptr;
+        void* tex1_view = nullptr;
+        void* tex2_view = nullptr;
+        if (!m_desc.vk_textures.empty() && !m_desc.vk_textures[0].slots.empty()) {
+            tex0_view = reinterpret_cast<void*>(m_desc.vk_textures[0].getActive().view);
+        }
+        if (m_desc.vk_textures.size() > 1 && !m_desc.vk_textures[1].slots.empty()) {
+            tex1_view = reinterpret_cast<void*>(m_desc.vk_textures[1].getActive().view);
+        }
+        if (m_desc.vk_textures.size() > 2 && !m_desc.vk_textures[2].slots.empty()) {
+            tex2_view = reinterpret_cast<void*>(m_desc.vk_textures[2].getActive().view);
+        }
+        int tex0_rw = 0;
+        int tex0_rh = 0;
+        if (m_desc.scene != nullptr && !m_desc.textures.empty()) {
+            const auto rt_it = m_desc.scene->renderTargets.find(m_desc.textures[0]);
+            if (rt_it != m_desc.scene->renderTargets.end()) {
+                tex0_rw = rt_it->second.width;
+                tex0_rh = rt_it->second.height;
+            }
+        }
+        const uint32_t vbufs = static_cast<uint32_t>(m_desc.vertex_bufs.size());
+        const int immutable = m_desc.immutable_mesh ? 1 : 0;
+        void* gpu = nullptr;
+        if (m_desc.immutable_mesh != nullptr && !m_desc.immutable_mesh->vertices.empty()) {
+            gpu = reinterpret_cast<void*>(m_desc.immutable_mesh->vertices[0].handle());
+        } else if (m_desc.dyn_vertex && rr.dyn_buf != nullptr) {
+            gpu = reinterpret_cast<void*>(rr.dyn_buf->gpuBuf());
+        } else if (rr.vertex_buf != nullptr) {
+            gpu = reinterpret_cast<void*>(rr.vertex_buf->gpuBuf());
+        }
+        const int omset =
+            DestDrawOmsetInitialLayout(m_desc, VK_ATTACHMENT_LOAD_OP_DONT_CARE) ==
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                ? 1
+                : 0;
+        const uint64_t voff = vbufs > 0 ? static_cast<uint64_t>(m_desc.vertex_bufs[0].offset) : 0;
+        const uint64_t vsize = vbufs > 0 ? static_cast<uint64_t>(m_desc.vertex_bufs[0].size) : 0;
+        const int vvalid = vbufs > 0 && m_desc.vertex_bufs[0] ? 1 : 0;
+        float stage_xy[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+        int stage_ok = 0;
+        StagingBuffer* stage = m_desc.dyn_vertex ? rr.dyn_buf : rr.vertex_buf;
+        if (stage != nullptr && vbufs > 0 && m_desc.vertex_bufs[0]) {
+            const auto& va = (m_desc.node != nullptr && m_desc.node->Mesh() != nullptr &&
+                              m_desc.node->Mesh()->VertexCount() > 0)
+                                 ? &m_desc.node->Mesh()->GetVertexArray(0)
+                                 : nullptr;
+            const usize stride = va != nullptr ? va->OneSizeOf() : sizeof(float) * 5;
+            std::array<uint8_t, 128> raw {};
+            if (stage->peekBytes(m_desc.vertex_bufs[0], raw) && stride >= 8) {
+                stage_ok = 1;
+                for (int i = 0; i < 4; ++i) {
+                    const float* p = reinterpret_cast<const float*>(raw.data() + i * stride);
+                    stage_xy[i * 2] = p[0];
+                    stage_xy[i * 2 + 1] = p[1];
+                }
+            }
+        }
+        LOG_INFO("DestDrawDateExec: id=%d phase=%d skip='%s' draw=%u verts=%u "
+                 "extent=%ux%u mesh=[%.1f %.1f %.1f %.1f] output='%s' "
+                 "out_view=%p tex0=%p tex1=%p tex2=%p ntex=%zu fb=%d "
+                 "tex0_rt=%dx%d vbufs=%u immutable=%d gpu=%p dyn=%d omset=%d "
+                 "vvalid=%d voff=%llu vsize=%llu ubo_off=%llu stage_ok=%d "
+                 "stage=[%.2f %.2f %.2f %.2f %.2f %.2f %.2f %.2f] "
+                 "out_img=%p pipe=%p pass=%p key='%s'",
+                 m_desc.layer_id,
+                 static_cast<int>(m_desc.dest_draw_phase),
+                 skip,
+                 m_desc.draw_count,
+                 verts,
+                 m_desc.vk_output.extent.width,
+                 m_desc.vk_output.extent.height,
+                 min_x,
+                 max_x,
+                 min_y,
+                 max_y,
+                 m_desc.output.c_str(),
+                 reinterpret_cast<void*>(m_desc.vk_output.view),
+                 tex0_view,
+                 tex1_view,
+                 tex2_view,
+                 m_desc.vk_textures.size(),
+                 m_desc.fb ? 1 : 0,
+                 tex0_rw,
+                 tex0_rh,
+                 vbufs,
+                 immutable,
+                 gpu,
+                 m_desc.dyn_vertex ? 1 : 0,
+                 omset,
+                 vvalid,
+                 static_cast<unsigned long long>(voff),
+                 static_cast<unsigned long long>(vsize),
+                 static_cast<unsigned long long>(m_desc.ubo_buf.offset),
+                 stage_ok,
+                 stage_xy[0],
+                 stage_xy[1],
+                 stage_xy[2],
+                 stage_xy[3],
+                 stage_xy[4],
+                 stage_xy[5],
+                 stage_xy[6],
+                 stage_xy[7],
+                 reinterpret_cast<void*>(m_desc.vk_output.handle),
+                 m_desc.pipeline.handle ? reinterpret_cast<void*>(*m_desc.pipeline.handle)
+                                        : nullptr,
+                 m_desc.pipeline.pass ? reinterpret_cast<void*>(*m_desc.pipeline.pass)
+                                      : nullptr,
+                 m_desc.pipeline.cache_key.c_str());
+        float res0[4] = { 0, 0, 0, 0 };
+        float scale[2] = { 0, 0 };
+        float mvp00 = 0;
+        float mvp03 = 0;
+        float mvp11 = 0;
+        float mvp13 = 0;
+        int ubo_ok = 0;
+        if (m_ubo_staging != nullptr && m_desc.ubo_buf) {
+            std::vector<uint8_t> ubo(static_cast<size_t>(m_desc.ubo_buf.size), 0);
+            if (m_ubo_staging->peekBytes(m_desc.ubo_buf, ubo)) {
+                ubo_ok = 1;
+                auto read_f = [&](std::string_view name, float* out, size_t n) {
+                    const auto it = m_ubo_block.member_map.find(std::string(name));
+                    if (it == m_ubo_block.member_map.end()) return;
+                    const size_t off = it->second.offset;
+                    const size_t bytes = std::min(n * sizeof(float), it->second.size);
+                    if (off + bytes > ubo.size()) return;
+                    std::memcpy(out, ubo.data() + off, bytes);
+                };
+                read_f("g_Texture0Resolution", res0, 4);
+                read_f("g_Scale", scale, 2);
+                float mvp[16] = {};
+                read_f("g_ModelViewProjectionMatrix", mvp, 16);
+                mvp00 = mvp[0];
+                mvp11 = mvp[5];
+                mvp03 = mvp[12];
+                mvp13 = mvp[13];
+            }
+        }
+        LOG_INFO("DestDrawUbo: id=%d phase=%d ubo_ok=%d size=%llu off=%llu "
+                 "res0=[%.1f %.1f %.1f %.1f] scale=[%.3f %.3f] "
+                 "mvp00=%.6f mvp11=%.6f mvpT=[%.3f %.3f]",
+                 m_desc.layer_id,
+                 static_cast<int>(m_desc.dest_draw_phase),
+                 ubo_ok,
+                 static_cast<unsigned long long>(m_desc.ubo_buf.size),
+                 static_cast<unsigned long long>(m_desc.ubo_buf.offset),
+                 res0[0],
+                 res0[1],
+                 res0[2],
+                 res0[3],
+                 scale[0],
+                 scale[1],
+                 mvp00,
+                 mvp11,
+                 mvp03,
+                 mvp13);
+    };
     if (m_desc.should_execute && ! m_desc.should_execute()) {
         // Runtime-gated helper passes stay in the render graph so visibility flips do not rebuild
         // framebuffer topology. Returning before uniform updates and draw submission makes the pass
         // a true no-op on frames where its fallback branch is not active.
+        if (leftover_417) LOG_INFO("DestDrawLeftoverExec: id=417 skip=should_execute");
+        if (leftover_date)
+            LOG_INFO("DestDrawLeftoverExec: id=%d skip=should_execute", m_desc.layer_id);
+        log_date_dest("should_execute");
         return;
     }
 
@@ -1827,6 +2198,10 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
         // Effect-local visibility is a stricter contract: a hidden effect must not run its shader
         // pass, otherwise the hidden branch would still overwrite the ping-pong output that the
         // bypass copy is responsible for preserving.
+        if (leftover_417) LOG_INFO("DestDrawLeftoverExec: id=417 skip=local_visible");
+        if (leftover_date)
+            LOG_INFO("DestDrawLeftoverExec: id=%d skip=local_visible", m_desc.layer_id);
+        log_date_dest("local_visible");
         return;
     }
 
@@ -1835,8 +2210,28 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
         // The render graph has still reached this pass's ordering point even when authored
         // visibility turns the shader into a no-op for the frame. Releasing final-read keys here
         // prevents temporary render targets from staying pinned only because no draw was recorded.
+        if (leftover_417) LOG_INFO("DestDrawLeftoverExec: id=417 skip=visible");
+        if (leftover_date)
+            LOG_INFO("DestDrawLeftoverExec: id=%d skip=visible", m_desc.layer_id);
+        log_date_dest("visible");
         return;
     }
+    if (leftover_417) {
+        LOG_INFO("DestDrawLeftoverExec: id=417 draw=%u extent=%ux%u fb=%d",
+                 m_desc.draw_count,
+                 m_desc.vk_output.extent.width,
+                 m_desc.vk_output.extent.height,
+                 m_desc.fb ? 1 : 0);
+    }
+    if (leftover_date) {
+        LOG_INFO("DestDrawLeftoverExec: id=%d draw=%u extent=%ux%u fb=%d",
+                 m_desc.layer_id,
+                 m_desc.draw_count,
+                 m_desc.vk_output.extent.width,
+                 m_desc.vk_output.extent.height,
+                 m_desc.fb ? 1 : 0);
+    }
+    log_date_dest("");
 
     if (auto* scene = m_desc.scene != nullptr ? m_desc.scene : rr.scene;
         scene != nullptr && ShaderDrawSamplesResolvedDefault(m_desc.textures)) {
@@ -1928,6 +2323,38 @@ void ShaderDrawCore::execute(const Device& device, RenderingResources& rr) {
                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                             VK_DEPENDENCY_BY_REGION_BIT,
                             imb);
+    }
+
+    // TEXT_E0_IDEST 0x1401e9681 / POSTFX_OMSET 0x1401ebf8c: OMSet leftover /
+    // FullCompo as the color target. Dest-draw leftover and HORIZONTAL are
+    // DONT_CARE after TextureCache bootstrap (SHADER_READ). Transition the
+    // output to COLOR_ATTACHMENT so BeginRenderPass matches the OMSet analog.
+    if (m_desc.vk_output.handle != VK_NULL_HANDLE &&
+        DestDrawOmsetInitialLayout(m_desc, VK_ATTACHMENT_LOAD_OP_DONT_CARE) ==
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+        VkImageMemoryBarrier to_color {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+            .oldLayout        = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .newLayout        = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .image            = m_desc.vk_output.handle,
+            .subresourceRange =
+                VkImageSubresourceRange {
+                    .aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .baseMipLevel   = 0,
+                    .levelCount     = VK_REMAINING_MIP_LEVELS,
+                    .baseArrayLayer = 0,
+                    .layerCount     = VK_REMAINING_ARRAY_LAYERS,
+                },
+        };
+        cmd.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            VK_DEPENDENCY_BY_REGION_BIT,
+                            to_color);
     }
 
     m_desc.depth_clear_value.depthStencil = { m_desc.depth_clear, 0 };
@@ -2133,6 +2560,8 @@ void ShaderDrawCore::destroy(RenderingResources& rr) {
         m_desc.index_buf = {};
     }
     rr.dyn_buf->unallocateSubRef(m_desc.ubo_buf);
+    m_ubo_staging = nullptr;
+    m_ubo_ready   = false;
     m_desc.ubo_buf = {};
 }
 

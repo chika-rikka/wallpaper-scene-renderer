@@ -119,6 +119,11 @@ struct WPNodeTransformBinding {
 struct EffectTextureProjectionBinding {
     SceneNode* node { nullptr };
     SceneMesh* mesh { nullptr };
+    // Official +0x2f0/+0x2f4. Leftover dest-draw +0x9b0 and g_ETVP take S(w/2)
+    // at DEST_MVP 0x1401ec51f / G_ETVP 0x1401ec338. Last-pass g_MVP is +0x930
+    // camera*dest, not +0x9b0. Dest 3×3 does not scale (0x140185150).
+    float      width { 0.0f };
+    float      height { 0.0f };
 };
 
 struct PuppetSurfaceBinding {
@@ -128,9 +133,7 @@ struct PuppetSurfaceBinding {
 
 struct WPShaderValueData {
     std::array<float, 2> parallaxDepth { 0.0f, 0.0f };
-    // An omitted scene field and an explicit "1 1" have the same numeric value but different
-    // child-layer semantics: omitted depth inherits the parent contract, while explicit depth is
-    // independent. Internal renderer nodes default to authored.
+    // Presence does not change the runtime contract. Internal renderer nodes default to authored.
     bool                 parallaxDepthAuthored { true };
     // index + name
     std::vector<std::pair<usize, std::string>> renderTargets;
@@ -160,9 +163,12 @@ struct WPShaderValueData {
         suppress_model_parallax = suppress_own_model_parallax;
     }
 
-    void SetEffectTextureProjection(SceneNode* projection_node, SceneMesh* projection_mesh) {
-        effect_texture_projection.node = projection_node;
-        effect_texture_projection.mesh = projection_mesh;
+    void SetEffectTextureProjection(SceneNode* projection_node, SceneMesh* projection_mesh,
+                                    float width = 0.0f, float height = 0.0f) {
+        effect_texture_projection.node   = projection_node;
+        effect_texture_projection.mesh   = projection_mesh;
+        effect_texture_projection.width  = width;
+        effect_texture_projection.height = height;
     }
 
     void SetPuppetSurface(SceneImageEffectLayer* surface_layer, SceneMesh* skinned_mesh) {
@@ -204,7 +210,8 @@ struct WPShaderValueData {
     bool IsBoneAttached() const { return transform_binding.IsBoneAttachment(); }
 
     bool AppliesModelParallax() const {
-        return ! suppress_model_parallax && ! transform_binding.IsBoneAttachment();
+        // Official Path B (FUN_14018aac0) has no bone skip. Attach is dest-only.
+        return ! suppress_model_parallax;
     }
 
     SceneNode* TransformParent() const { return transform_binding.parent; }
@@ -224,6 +231,7 @@ public:
 
     void PrepareFrame() override;
     void FrameBegin() override;
+    void ComposeDrawWalker() override;
 
     void InitUniforms(SceneNode*, const ExistsUniformOp&) override;
     void UpdateUniforms(SceneNode*, sprite_map_t&, const UpdateUniformOp&,
@@ -250,7 +258,7 @@ public:
     void     AdvanceAllPuppets();
     uint64_t NextPuppetFrameSerial() const noexcept { return m_puppet_frame_serial + 1; }
 
-    void SetScreenSize(i32 w, i32 h) override { m_screen_size = { (float)w, (float)h }; }
+    void SetScreenSize(i32 w, i32 h) override;
 
 private:
     Scene*               m_scene;
@@ -263,6 +271,8 @@ private:
     // g_PointerPosition to decide whether to inject a new cursor impulse into their simulation FBOs.
     std::array<float, 2> m_mousePosLast { 0.5f, 0.5f };
     std::array<float, 2> m_mousePosInput { 0.5f, 0.5f };
+    std::array<float, 2> m_parallaxLookat { 0.0f, 0.0f };
+    bool                 m_parallaxLookatValid { false };
 
     std::array<float, 2> m_screen_size { 1920, 1080 };
 

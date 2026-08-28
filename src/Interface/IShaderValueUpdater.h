@@ -28,6 +28,10 @@ struct ShaderUniformOverrides {
     // against the live active camera without permanently changing the node's authored camera.
     bool             use_active_camera_for_uniforms { false };
     bool             use_active_camera_for_parallax { false };
+    // Official 0x1401ec799: I-internal writes identity into [engine+0x30].
+    // Dest blit after I pop uses dest (0x1401e9dd5). This is the pass domain,
+    // not a camera-name guess.
+    bool             use_identity_model { false };
 };
 
 class IShaderValueUpdater : NoCopy, NoMove {
@@ -39,6 +43,9 @@ public:
     // later FrameBegin hook remains the draw-phase boundary for uniform/cache consumers.
     virtual void PrepareFrame()                                                    = 0;
     virtual void FrameBegin()                                                      = 0;
+    // Official frame draw 0x14018aac0 (FRAME_DEST_NO_RESET / COMPOSE_WRAP) hosts
+    // Path B push/T+=/vt+0x50/pop. Not FrameBegin.
+    virtual void ComposeDrawWalker()                                               = 0;
     virtual void InitUniforms(SceneNode*, const ExistsUniformOp&)                  = 0;
     virtual void UpdateUniforms(SceneNode*, sprite_map_t&, const UpdateUniformOp&,
                                 const ShaderUniformOverrides* overrides = nullptr) = 0;

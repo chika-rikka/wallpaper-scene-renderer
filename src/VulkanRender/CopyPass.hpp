@@ -25,6 +25,8 @@ public:
         // contract: their authored copy commands only run while the effect is visible, and their
         // bypass copy only runs while the effect is hidden.
         std::function<bool()> should_execute;
+        DestDrawPhase dest_draw_phase { DestDrawPhase::None };
+        int32_t layer_id { 0 };
     };
 
     CopyPass(const Desc&);
@@ -37,6 +39,8 @@ public:
     std::string residencyKey() const override;
     void absorbResidencyGraphState(const VulkanPass&) override;
     bool referencesRenderTarget(std::string_view) const override;
+    DestDrawPhase destDrawPhase() const override { return m_desc.dest_draw_phase; }
+    int32_t destDrawLayerId() const override { return m_desc.layer_id; }
 
 private:
     Desc m_desc;

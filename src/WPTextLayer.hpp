@@ -103,6 +103,8 @@ bool ApplyTextLayerPropertyValue(TextLayerRuntimeState& state,
                                  std::string_view       property_name,
                                  const WPDynamicValue&  value);
 bool SyncTextLayerSceneMaterials(Scene& scene, int32_t layer_id);
+// TEXT_2F0 0x140258916: layout AABB → +0x2f0 then +0x2d8/+0x2e8.
+void PublishTextDestDrawMeshes(Scene& scene, int32_t layer_id);
 bool RasterizeTextPrimitiveLayout(fs::VFS&                 vfs,
                                   wpscene::WPTextObject&   object,
                                   const TextLayerRenderContract& render_contract,

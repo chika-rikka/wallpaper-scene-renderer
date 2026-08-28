@@ -2,6 +2,7 @@
 
 #include "VulkanPass.hpp"
 
+#include <Eigen/Dense>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -30,6 +31,7 @@ public:
         // rebuilds swap primitives under stable nodes; the layer id remains the durable refresh key.
         int32_t     layer_id { 0 };
         bool        execute_when_hidden { false };
+        DestDrawPhase dest_draw_phase { DestDrawPhase::None };
         std::string output;
         AlphaWritePolicy alpha_write_policy { AlphaWritePolicy::Preserve };
 
@@ -60,6 +62,10 @@ public:
     void absorbResidencyGraphState(const VulkanPass&) override;
     bool referencesRenderTarget(std::string_view) const override;
     bool referencesTextLayer(int32_t) const override;
+    DestDrawPhase destDrawPhase() const override { return m_desc.dest_draw_phase; }
+    int32_t destDrawLayerId() const override { return m_desc.layer_id; }
+    wallpaper::SceneNode* destDrawNode() const override { return m_desc.node; }
+    void writeLastPassMvp(const Eigen::Matrix4f& mvp) override;
 
 private:
     struct MeshBuffers {
@@ -79,7 +85,14 @@ private:
     Desc m_desc;
     MeshBuffers m_background_buffers;
     std::vector<MeshBuffers> m_page_buffers;
+    MeshBuffers m_clearalpha_buffers;
+    PipelineParameters m_clearalpha_pipeline;
+    ImageSlotsRef m_clearalpha_fullfb;
+    StagingBufferRef m_clearalpha_ubo_buf;
     uint32_t m_loaded_atlas_version { std::numeric_limits<uint32_t>::max() };
+    Eigen::Matrix4f m_dest_ortho_mvp { Eigen::Matrix4f::Identity() };
+    bool m_has_dest_ortho_mvp { false };
+    bool m_has_clearalpha { false };
 };
 
 } // namespace vulkan

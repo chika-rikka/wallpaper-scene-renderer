@@ -66,6 +66,8 @@ struct SceneImageEffectNode {
     // that layer and recursively resolve the same effect chain a second time.
     std::string camera_override;
     bool        use_active_camera_for_parallax { false };
+    // Official 0x1401ec799 I-internal. Puppet surface writer is that pass.
+    bool        use_identity_model { false };
     bool        clear_before_draw { false };
     AlphaWritePolicy alpha_write_policy { AlphaWritePolicy::Preserve };
     // Some effect chains end with a synthetic layer-surface writer. Animated puppet images with
@@ -153,6 +155,8 @@ public:
     };
     SceneImageEffectLayer(SceneNode* node, float w, float h, std::string_view pingpong_a,
                           std::string_view pingpong_b);
+    float AuthoredWidth() const { return m_authored_width; }
+    float AuthoredHeight() const { return m_authored_height; }
 
     void AddEffect(const std::shared_ptr<SceneImageEffect>& node) { m_effects.push_back(node); }
     std::size_t EffectCount() const { return m_effects.size(); }
@@ -173,6 +177,9 @@ public:
     }
     bool        FinalCompositeSamplesPremultipliedSource() const {
         return m_final_composite.samples_premultiplied_source;
+    }
+    bool        FinalPremultipliedSourceBlend() const {
+        return m_final_premultiplied_source_blend;
     }
     void        SetFinalCompositeSource(std::string source);
     void        SetFullscreen(bool fullscreen) { m_fullscreen = fullscreen; }
@@ -203,8 +210,14 @@ public:
         // stale framebuffer-sized quads while the authored effect is hidden.
         m_final_composite.hidden_policy = policy;
     }
-    SceneNode*  WorldNode() const { return m_worldNode; }
+    // Parsed layer SceneNode. Official +0x158 is SceneObject, not a leftover
+    // sibling named WorldNode. Leftover and last-pass are dest-draw phases.
+    SceneNode*  LayerNode() const { return m_layer_node; }
+    BlendMode   FinalBlend() const { return m_final_blend; }
     void        SetFinalBlend(BlendMode m) { m_final_blend = m; }
+    void        SetFinalPremultipliedSourceBlend(bool premultiplied) {
+        m_final_premultiplied_source_blend = premultiplied;
+    }
     void        SyncResolvedOutputMesh();
     void        SyncResolvedNodeToWorld();
     void        SyncResolvedNodeToMatrix(const Eigen::Affine3f& world_affine);
@@ -250,9 +263,12 @@ private:
         bool private_final_uses_layer_surface { false };
     };
 
-    SceneNode*  m_worldNode;
+    SceneNode*  m_layer_node;
     std::string m_pingpong_a;
     std::string m_pingpong_b;
+    // Official image +0x2f0/+0x2f4. g_ETVP scales dest*VP by w/2,h/2 (0x1401ec338).
+    float       m_authored_width { 0.0f };
+    float       m_authored_height { 0.0f };
 
     // Fullscreen utility layers, such as Wallpaper Engine's postprocess framebuffer layer, are
     // authored in clip-space sized 2x2 quads. Their final effect pass must therefore stay on the
@@ -279,6 +295,7 @@ private:
     bool                       m_resolved_output_mesh_follows_final_mesh { true };
     FinalCompositeState        m_final_composite;
     BlendMode                  m_final_blend { BlendMode::Normal };
+    bool                       m_final_premultiplied_source_blend { false };
 
     std::vector<std::shared_ptr<SceneImageEffect>> m_effects;
 

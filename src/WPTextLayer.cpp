@@ -2422,11 +2422,24 @@ bool UpdateTextLayerBridgeBackingInternal(Scene& scene,
 
     bool any_target_changed = false;
     const auto bridge_logical_extent = ResolveVisibleTextDisplaySize(state);
+    auto* dest_object = scene.FindSceneObject(layer_id);
+    const bool dest_draw_named =
+        dest_object != nullptr && dest_object->kind() == SceneObjectKind::Text &&
+        dest_object->effect_count() > 0;
     for (const auto& bridge_target : bridge.render_targets) {
         auto render_target_it = scene.renderTargets.find(bridge_target.name);
         if (render_target_it == scene.renderTargets.end()) continue;
         auto& render_target = render_target_it->second;
         if (render_target.bind.enable) continue;
+        // TEXT_2F0 0x140258a02 / EFFECT_FBO_SIZE / NAMED_RT_VPSIZE:
+        // leftover +0x2c8 and scale-1 FullCompo are max(4,AABB). Letter-box
+        // backing is not official dest-draw size; overwriting it splits
+        // leftover TextPass Query from HORIZONTAL tex[0].
+        if (dest_draw_named &&
+            (sstart_with(bridge_target.name, WE_EFFECT_PPONG_PREFIX) ||
+             sstart_with(bridge_target.name, WE_FULL_COMPO_BUFFER_PREFIX))) {
+            continue;
+        }
 
         const auto target_logical_extent =
             ResolveTextBridgeRenderTargetExtent(bridge_target, bridge_logical_extent);
@@ -2478,6 +2491,12 @@ bool UpdateTextLayerBridgeBackingInternal(Scene& scene,
                  bridge_target.scale,
                  bridge_target.fit,
                  bridge_target.persistent_feedback ? "true" : "false");
+    }
+
+    if (dest_draw_named && dest_object != nullptr) {
+        // TEXT_2F0 0x140258a02: AABB write then vt+0xb8. Leftover +0x2c8 /
+        // scale-1 FullCompo stay max(4,AABB) after any TREE backing pass.
+        dest_object->SizeDestDrawNamedRts();
     }
 
     return any_target_changed;
@@ -2762,7 +2781,7 @@ bool ResolveBottomScreenAnchoredTextStack(std::vector<ScreenAnchoredTextPlacemen
 
 void SyncTextEffectLayerResolvedTransform(Scene&                  scene,
                                           SceneImageEffectLayer& effect_layer) {
-    auto* world_node = effect_layer.WorldNode();
+    auto* world_node = effect_layer.LayerNode();
     if (world_node == nullptr || scene.shaderValueUpdater == nullptr ||
         scene.activeCamera == nullptr) {
         return;
@@ -3110,7 +3129,8 @@ std::shared_ptr<SceneMesh> BuildTextPrimitiveBackgroundMesh(const SceneTextPrimi
 }
 
 std::shared_ptr<SceneMesh> BuildTextPrimitiveGlyphPageMesh(const SceneTextPrimitive& primitive,
-                                                           uint32_t                  page_index) {
+                                                           uint32_t                  page_index,
+                                                           bool layout_local = false) {
     auto mesh = std::make_shared<SceneMesh>(true);
 
     const auto page_count = primitive.layout.glyph_pages.size();
@@ -3155,10 +3175,26 @@ std::shared_ptr<SceneMesh> BuildTextPrimitiveGlyphPageMesh(const SceneTextPrimit
         const float rect_width = run.source_rect[2] * scale_x;
         const float rect_height = run.source_rect[3] * scale_y;
 
-        const float left = -primitive.layout.glyph_display_size[0] * 0.5f + rect_x + glyph_local_offset[0];
-        const float right = left + rect_width;
-        const float top = primitive.layout.glyph_display_size[1] * 0.5f - rect_y + glyph_local_offset[1];
-        const float bottom = top - rect_height;
+        // TEXT_LAYOUT_VERTS leftover: ox starts 0, oy starts 0, record-box
+        // addss/subss only (CLOCK_VERT_ADD). DEST_ORTHO_TNF maps that
+        // 0..AABB into named-RT NDC. Compose still uses ±half.
+        float left = 0.0f;
+        float right = 0.0f;
+        float top = 0.0f;
+        float bottom = 0.0f;
+        if (layout_local) {
+            left = rect_x;
+            right = rect_x + rect_width;
+            bottom = rect_y;
+            top = rect_y + rect_height;
+        } else {
+            left = -primitive.layout.glyph_display_size[0] * 0.5f + rect_x +
+                   glyph_local_offset[0];
+            right = left + rect_width;
+            top = primitive.layout.glyph_display_size[1] * 0.5f - rect_y +
+                  glyph_local_offset[1];
+            bottom = top - rect_height;
+        }
 
         positions.insert(positions.end(),
                          { left, bottom, 0.0f, left, top, 0.0f, right, bottom, 0.0f, right, top, 0.0f });
@@ -3196,6 +3232,19 @@ std::shared_ptr<SceneMesh> BuildTextPrimitiveGlyphPageMesh(const SceneTextPrimit
     mesh->AddIndexArray(std::move(index_array));
     mesh->SetDirty();
     return mesh;
+}
+
+void FillLeftoverGlyphPages(SceneTextPrimitive& primitive) {
+    primitive.leftover_glyph_pages.resize(primitive.layout.glyph_pages.size());
+    for (size_t page_index = 0; page_index < primitive.layout.glyph_pages.size(); page_index++) {
+        const auto& layout_page = primitive.layout.glyph_pages[page_index];
+        auto& renderable = primitive.leftover_glyph_pages[page_index];
+        renderable.page_index = static_cast<uint32_t>(page_index);
+        renderable.texture_key = layout_page.texture_key;
+        renderable.source_size = layout_page.source_size;
+        renderable.mesh = BuildTextPrimitiveGlyphPageMesh(
+            primitive, static_cast<uint32_t>(page_index), true);
+    }
 }
 
 struct TextLayerSceneGeometrySnapshot {
@@ -3252,6 +3301,7 @@ void SyncTextPrimitiveCanonicalState(TextLayerRuntimeState& state, bool rebuild_
         renderable.mesh = BuildTextPrimitiveGlyphPageMesh(*state.primitive,
                                                           static_cast<uint32_t>(page_index));
     }
+    FillLeftoverGlyphPages(*state.primitive);
 }
 
 bool ApplyTextLayerSceneGeometry(Scene&                         scene,
@@ -3308,6 +3358,7 @@ bool ApplyTextLayerSceneGeometry(Scene&                         scene,
     }
 
     UpdateTextLayerBridgeBackingInternal(scene, layer_id, state);
+    PublishTextDestDrawMeshes(scene, layer_id);
 
     return true;
 }
@@ -3405,6 +3456,7 @@ bool wallpaper::BuildSceneTextPrimitive(fs::VFS&                         vfs,
             .mesh = BuildTextPrimitiveGlyphPageMesh(*primitive, static_cast<uint32_t>(page_index)),
         });
     }
+    FillLeftoverGlyphPages(*primitive);
 
     const auto& layout = primitive->layout;
     LOG_INFO("SceneTextLayoutContract: layer=%d name='%s' bridge=%s authored-effects=%s "
@@ -3446,6 +3498,28 @@ bool wallpaper::BuildSceneTextPrimitive(fs::VFS&                         vfs,
 
     *out_primitive = std::move(primitive);
     return true;
+}
+
+void wallpaper::PublishTextDestDrawMeshes(Scene& scene, int32_t layer_id) {
+    auto state_it = scene.textLayers.find(layer_id);
+    if (state_it == scene.textLayers.end()) return;
+    auto* object = scene.FindSceneObject(layer_id);
+    if (object == nullptr || object->kind() != SceneObjectKind::Text) return;
+
+    // TEXT_2F0 0x140258916: +0x2f0 = layout AABB (or 2.0 if no +0x5a8).
+    // +0x320>0 adds 2*min(+0x4e8/+0x4ec, 512). Then vt+0xb0 / vt+0xb8.
+    float layout_w = 2.0f;
+    float layout_h = 2.0f;
+    if (state_it->second.primitive != nullptr) {
+        const auto& size = state_it->second.primitive->layout.logical_size;
+        if (size[0] > 0.0f) layout_w = size[0];
+        if (size[1] > 0.0f) layout_h = size[1];
+    }
+    const auto& pad = state_it->second.object.padding_edges;
+    object->ApplyTextDestSize(layout_w,
+                              layout_h,
+                              static_cast<float>(std::max(pad[1], pad[3])),
+                              static_cast<float>(std::max(pad[0], pad[2])));
 }
 
 bool wallpaper::SyncTextLayerSceneMaterials(Scene& scene, int32_t layer_id) {

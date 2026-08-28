@@ -1353,6 +1353,16 @@ void TextureCache::purgeQueuedWorkForKey(std::string_view key) {
     m_streaming_tex_uploads.erase(std::string(key));
 }
 
+void TextureCache::RecordPendingRenderTargetClears(vvk::CommandBuffer& cmd) {
+    if (m_pending_render_target_clears.empty()) return;
+    const auto clear_count = m_pending_render_target_clears.size();
+    for (const auto& clear : m_pending_render_target_clears) {
+        RecordClearNewRenderTargetToTransparentBlack(cmd, clear.image);
+    }
+    m_pending_render_target_clears.clear();
+    LOG_INFO("TextureCacheRecordPendingClears: clears=%zu", clear_count);
+}
+
 void TextureCache::RecordUploads(vvk::CommandBuffer& cmd) {
     if (m_pending_render_target_clears.empty() && m_pending_image_uploads.empty()) return;
 
@@ -1361,10 +1371,7 @@ void TextureCache::RecordUploads(vvk::CommandBuffer& cmd) {
     const auto upload_count = m_pending_image_uploads.size();
     const auto upload_bytes = PendingImageUploadBytes(m_pending_image_uploads);
 
-    for (const auto& clear : m_pending_render_target_clears) {
-        RecordClearNewRenderTargetToTransparentBlack(cmd, clear.image);
-    }
-    m_pending_render_target_clears.clear();
+    RecordPendingRenderTargetClears(cmd);
 
     for (auto& upload : m_pending_image_uploads) {
         RecordCopyImageData(

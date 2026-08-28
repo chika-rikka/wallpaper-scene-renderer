@@ -2,6 +2,7 @@
 
 #include "Scene/Scene.h"
 #include "Scene/SceneNode.h"
+#include "Scene/SceneShader.h"
 #include "SpecTexs.hpp"
 #include "Type.hpp"
 
@@ -93,3 +94,26 @@ bool CustomShaderPass::referencesImportedTexture(std::string_view texture_key) c
 void CustomShaderPass::setDescTex(u32 index, std::string_view tex_key) {
     m_core.setTexture(index, tex_key);
 }
+
+wallpaper::DestDrawPhase CustomShaderPass::destDrawPhase() const {
+    return m_core.data().dest_draw_phase;
+}
+
+int32_t CustomShaderPass::destDrawLayerId() const { return m_core.data().layer_id; }
+
+wallpaper::SceneNode* CustomShaderPass::destDrawNode() const { return m_core.data().node; }
+
+void CustomShaderPass::writeLastPassMvp(const Eigen::Matrix4f& mvp) {
+    m_core.WriteUniform(G_MVP, ShaderValue::fromMatrix(mvp));
+}
+
+void CustomShaderPass::writeLastPassInverseSlot(const Eigen::Matrix4f& mvp) {
+    // IMAGE_VT_F0 / UNIFORM_UPLOAD_MAP 0x1400d8749: id 0xd copies +0x8f0.
+    m_core.WriteUniform(G_MVPI, ShaderValue::fromMatrix(mvp));
+}
+
+bool CustomShaderPass::hasUniform(std::string_view name) const {
+    return m_core.HasUniform(name);
+}
+
+bool CustomShaderPass::uboReady() const { return m_core.UboReady(); }

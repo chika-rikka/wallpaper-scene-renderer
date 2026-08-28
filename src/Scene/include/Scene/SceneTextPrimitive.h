@@ -109,6 +109,9 @@ public:
     TextSourceBridge      bridge;
     std::shared_ptr<SceneMesh> background_mesh;
     std::vector<GlyphPageRenderable> glyph_pages;
+    // TEXT_LAYOUT_VERTS leftover dest-draw: layout-local 0..AABB, not
+    // ±half. TEXT_E8 / DEST_ORTHO_TNF maps (0..W,0..H) to NDC.
+    std::vector<GlyphPageRenderable> leftover_glyph_pages;
     uint32_t              atlas_version { 0 };
 
     [[nodiscard]] std::array<float, 2> VisibleDisplaySize() const { return layout.visible_display_size; }

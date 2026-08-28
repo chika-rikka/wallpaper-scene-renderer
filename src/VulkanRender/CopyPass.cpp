@@ -23,6 +23,8 @@ void CopyPass::absorbResidencyGraphState(const VulkanPass& next_pass) {
     // effect bypass paths. Reusing them keeps graph-diff accounting honest while allowing the newly
     // built topology to replace only the frame-local gate.
     m_desc.should_execute = next->m_desc.should_execute;
+    m_desc.dest_draw_phase = next->m_desc.dest_draw_phase;
+    m_desc.layer_id = next->m_desc.layer_id;
 }
 
 bool CopyPass::referencesRenderTarget(std::string_view render_target) const {

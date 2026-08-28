@@ -283,6 +283,19 @@ bool StagingBuffer::writeToBuf(const StagingBufferRef& ref, std::span<uint8_t> d
     return true;
 }
 
+bool StagingBuffer::peekBytes(const StagingBufferRef& ref, std::span<uint8_t> out) {
+    CHECK_REF(ref, return false);
+    if (out.empty()) return true;
+    if (m_stage_raw == nullptr) {
+        mapStageBuf();
+    }
+    if (m_stage_raw == nullptr) return false;
+    const size_t n = std::min(out.size(), static_cast<size_t>(ref.size));
+    const uint8_t* raw = static_cast<const uint8_t*>(m_stage_raw) + ref.offset;
+    std::copy(raw, raw + n, out.begin());
+    return true;
+}
+
 bool StagingBuffer::fillBuf(const StagingBufferRef& ref, size_t offset, size_t size, uint8_t c) {
     CHECK_REF(ref, return false);
 

@@ -14,6 +14,7 @@
 #include "Scene/ShadowAtlas.hpp"
 #include "Scene/LightingV1.hpp"
 #include "Scene/SceneTexture.h"
+#include "Scene/SceneIndexArray.h"
 
 #include "WPShaderParser.hpp"
 #include "WPTexImageParser.hpp"
@@ -337,24 +338,14 @@ struct ParseContext {
     std::unordered_map<int32_t, int32_t>                    initial_parent_by_layer_id;
     std::unordered_map<int32_t, std::shared_ptr<SceneNode>> object_nodes;
     std::unordered_map<int32_t, const WPPuppet*>            object_puppets;
+    // Official passthrough layers: model key at 0x1401fae95, +0x304 bit5 at
+    // 0x1401faeb8, +0x120 bit2 at 0x1401fb35f.
+    std::unordered_set<int32_t>                             passthrough_layer_ids;
     // Model chunk passes share the main scene target. Tracking their parse order here lets the
     // model-only material state preserve color after the first model pass without changing the
     // legacy load-op behavior of 2D image/effect passes.
     std::unordered_map<std::string, usize> model_pass_count_by_output;
 };
-
-bool IsZeroParallaxDepth(const std::array<float, 2>& depth) {
-    return std::abs(depth[0]) <= 1e-6f && std::abs(depth[1]) <= 1e-6f;
-}
-
-std::string NormalizeParallaxPeerName(std::string_view name) {
-    std::string normalized;
-    normalized.reserve(name.size());
-    for (unsigned char ch : name) {
-        if (std::isalnum(ch)) normalized.push_back(static_cast<char>(std::tolower(ch)));
-    }
-    return normalized;
-}
 
 std::array<float, 2> ImageObjectParallaxDepth(const wpscene::WPImageObject& object) {
     return { object.parallaxDepth[0], object.parallaxDepth[1] };
@@ -364,8 +355,23 @@ std::array<float, 2> TextObjectParallaxDepth(const wpscene::WPTextObject& object
     return { object.parallaxDepth[0], object.parallaxDepth[1] };
 }
 
-bool LayerUsesRoutedParent(int32_t parent_id, std::string_view attachment) {
-    return parent_id != 0 && attachment.empty();
+void NotePassthroughLayer(ParseContext& context, const wpscene::WPImageObject& image) {
+    if (image.id == 0 || ! image.config.passthrough) return;
+    context.passthrough_layer_ids.insert(image.id);
+    if (context.scene != nullptr) context.scene->passthroughLayerIds.insert(image.id);
+}
+
+bool LayerUsesRoutedParent(const ParseContext& context, int32_t parent_id,
+                           std::string_view attachment) {
+    (void)attachment;
+    // Official image draw 0x1401e8f63 loads parent at +0x180. If that parent
+    // has +0x120 bit2 it skips the `_rt_FullFrameBuffer` bind at 0x1401e8f78
+    // (0x1401e8f6f jne 0x1401e8f9b). Bit2 is written only for passthrough:
+    // 0x1401fae95 key, 0x1401faeb8 or +0x304 0x20, 0x1401fb35f or +0x120 4.
+    // models/util/composelayer.json and projectlayer.json both set
+    // passthrough. Empty 0x2c0 objects still draw nothing (vt+0x50
+    // 0x14000ec30) and are not registered as proxies.
+    return parent_id != 0 && context.passthrough_layer_ids.count(parent_id) != 0;
 }
 
 struct WPEmptyObject {
@@ -563,85 +569,6 @@ using WPObjectVar =
 
 constexpr std::string_view kSceneModelPerspectiveCameraName { "__hanabi_model_perspective" };
 constexpr std::string_view kModelReflectionTargetName { "_rt_Reflection" };
-
-void ApplyNodeOwnerParallaxFallback(ParseContext& context, int32_t owner_id,
-                                    const std::array<float, 2>& depth, SceneNode* anchor,
-                                    bool suppress_model_parallax = false) {
-    if (context.scene == nullptr || context.shader_updater == nullptr) return;
-
-    for (const auto& [node, node_owner_id] : context.scene->nodeOwners) {
-        if (node == nullptr || node_owner_id != owner_id) continue;
-        if (! node->Camera().empty()) continue;
-        auto* node_data = context.shader_updater->GetNodeData(node);
-        if (node_data == nullptr) continue;
-
-        // Only camera-facing/world-facing nodes should receive this repaired parallax contract.
-        // Effect source nodes render inside private effect cameras, so moving them here would bake
-        // the same mouse offset into the offscreen texture and then apply it again at composition.
-        node_data->SetParallaxContract(depth, anchor, suppress_model_parallax);
-    }
-}
-
-void ApplyMissingImageParallaxFallbacks(ParseContext&                   context,
-                                        const std::vector<WPObjectVar>& objects) {
-    std::unordered_map<std::string, int32_t> explicit_parallax_peer_by_name;
-
-    for (const auto& object : objects) {
-        std::visit(visitor::overload {
-                       [&explicit_parallax_peer_by_name](const wpscene::WPImageObject& image) {
-                           if (! image.parallaxDepthAuthored ||
-                               IsZeroParallaxDepth(ImageObjectParallaxDepth(image))) {
-                               return;
-                           }
-                           const auto key = NormalizeParallaxPeerName(image.name);
-                           if (! key.empty()) explicit_parallax_peer_by_name.emplace(key, image.id);
-                       },
-                       [&explicit_parallax_peer_by_name](const WPEmptyObject& empty) {
-                           if (! empty.parallaxDepthAuthored ||
-                               IsZeroParallaxDepth(empty.parallaxDepth)) {
-                               return;
-                           }
-                           const auto key = NormalizeParallaxPeerName(empty.name);
-                           if (! key.empty()) explicit_parallax_peer_by_name.emplace(key, empty.id);
-                       },
-                       [](const auto&) {
-                       },
-                   },
-                   object);
-    }
-
-    for (const auto& object : objects) {
-        const auto* image = std::get_if<wpscene::WPImageObject>(&object);
-        if (image == nullptr || image->parallaxDepthAuthored || image->parent != 0) continue;
-
-        const auto key     = NormalizeParallaxPeerName(image->name);
-        auto       peer_it = explicit_parallax_peer_by_name.find(key);
-        if (peer_it != explicit_parallax_peer_by_name.end() && peer_it->second != image->id) {
-            auto peer_node_it = context.object_nodes.find(peer_it->second);
-            if (peer_node_it != context.object_nodes.end() && peer_node_it->second) {
-                // Some WE projects split a character into a static-looking root image plus an
-                // explicitly-parallaxed detail/effect group with the same normalized name. The root
-                // layer has no authored parent, but visually it must inherit the detail group's
-                // parallax offset so the pieces stay locked together.
-                ApplyNodeOwnerParallaxFallback(
-                    context, image->id, { 0.0f, 0.0f }, peer_node_it->second.get());
-                continue;
-            }
-        }
-
-        const bool is_compose_layer         = image->image == "models/util/composelayer.json";
-        const bool has_authored_descendants = context.dependent_parent_ids.count(image->id) != 0;
-        const bool is_compose_container =
-            is_compose_layer && (! image->effects.empty() || has_authored_descendants);
-        if (is_compose_container) {
-            // A composition source subtracts its parallax while rendering routed children into a
-            // private target. Its final writer must restore the resolved default in scene space;
-            // suppressing that offset makes an omitted root and child cancel to a static result.
-            ApplyNodeOwnerParallaxFallback(
-                context, image->id, wpscene::kDefaultParallaxDepth, nullptr, false);
-        }
-    }
-}
 
 namespace
 {
@@ -939,12 +866,23 @@ int32_t AllocateDynamicLayerId(const Scene& scene) {
 
 // mapRate < 1.0
 void GenCardMesh(SceneMesh& mesh, const std::array<uint16_t, 2> size,
-                 const std::array<float, 2> mapRate = { 1.0f, 1.0f }) {
-    float left   = -(size[0] / 2.0f);
-    float right  = size[0] / 2.0f;
-    float bottom = -(size[1] / 2.0f);
-    float top    = size[1] / 2.0f;
-    float z      = 0.0f;
+                 const std::array<float, 2> mapRate = { 1.0f, 1.0f },
+                 bool centered = true) {
+    // Official 0x1401ede30: flags bit0 set → ±extent/2; bit0 clear → 0..extent
+    // (0x1401eb19f flags=0 for +0x2d8). {2,2}+centered is +0x2e0 ±1 (0x14020679c).
+    float left, right, bottom, top;
+    if (centered) {
+        left   = -(size[0] / 2.0f);
+        right  = size[0] / 2.0f;
+        bottom = -(size[1] / 2.0f);
+        top    = size[1] / 2.0f;
+    } else {
+        left   = 0.0f;
+        right  = static_cast<float>(size[0]);
+        bottom = 0.0f;
+        top    = static_cast<float>(size[1]);
+    }
+    float z = 0.0f;
 
     float tw = mapRate[0], th = mapRate[1];
 
@@ -972,6 +910,94 @@ void GenCardMesh(SceneMesh& mesh, const std::array<uint16_t, 2> size,
     vertex.SetVertex(WE_IN_POSITION, pos);
     vertex.SetVertex(WE_IN_TEXCOORD, texCoord);
     mesh.AddVertexArray(std::move(vertex));
+}
+
+bool ReadNamedVec2Constant(const std::unordered_map<std::string, std::vector<float>>& values,
+                           const char* name, std::array<float, 2>& out) {
+    const auto it = values.find(name);
+    if (it == values.end() || it->second.size() < 2) return false;
+    out[0] = it->second[0];
+    out[1] = it->second[1];
+    return true;
+}
+
+bool LoadShapePerspectivePoints(const wpscene::WPImageObject& image,
+                                std::array<std::array<float, 2>, 4>& points) {
+    // Official shape vt+0x110 0x140260190 looks up point0..point3 on the first
+    // effect (0x14026025e / 0x140260383). Any miss jumps to 0x14026072d, the
+    // default +0x2e8 size card. Image vt+0x110 is ret (0x14000ec30).
+    if (image.image != "__hanabi_shape_directdraw") return false;
+    auto try_map = [&](const std::unordered_map<std::string, std::vector<float>>& values) {
+        return ReadNamedVec2Constant(values, "point0", points[0]) &&
+               ReadNamedVec2Constant(values, "point1", points[1]) &&
+               ReadNamedVec2Constant(values, "point2", points[2]) &&
+               ReadNamedVec2Constant(values, "point3", points[3]);
+    };
+    for (const auto& effect : image.effects) {
+        for (const auto& pass : effect.passes) {
+            if (try_map(pass.constantshadervalues)) return true;
+        }
+        for (const auto& material : effect.materials) {
+            if (try_map(material.constantshadervalues)) return true;
+        }
+    }
+    return false;
+}
+
+void GenOfficialShapePerspectiveDestMesh(SceneMesh& mesh, const std::array<float, 2>& size,
+                                         const std::array<std::array<float, 2>, 4>& points) {
+    // Official 0x140260441–0x140260644. xmm11/xmm13 are +0x2f0/+0x2f4. 0x1404926c0
+    // is 0.5, 0x140492778 is 1.0 double. Vertex i: x=w*u-w/2, y=h*(1-v)-h/2, z=0,
+    // uv=(u,v). Stored at +0x2e8. Dest then uses dest*VP without S(w/2) because
+    // the mesh is already sized (TREE unit_card check / official r15!=0).
+    const float w      = std::max(1.0f, size[0]);
+    const float h      = std::max(1.0f, size[1]);
+    const float half_w = w * 0.5f;
+    const float half_h = h * 0.5f;
+    std::array<float, 12> pos {};
+    std::array<float, 8>  texCoord {};
+    for (int i = 0; i < 4; ++i) {
+        const float u = points[static_cast<std::size_t>(i)][0];
+        const float v = points[static_cast<std::size_t>(i)][1];
+        pos[static_cast<std::size_t>(i) * 3 + 0] = w * u - half_w;
+        pos[static_cast<std::size_t>(i) * 3 + 1] = h * (1.0f - v) - half_h;
+        pos[static_cast<std::size_t>(i) * 3 + 2] = 0.0f;
+        texCoord[static_cast<std::size_t>(i) * 2 + 0] = u;
+        texCoord[static_cast<std::size_t>(i) * 2 + 1] = v;
+    }
+
+    SceneVertexArray vertex(
+        {
+            { WE_IN_POSITION.data(), VertexType::FLOAT3 },
+            { WE_IN_TEXCOORD.data(), VertexType::FLOAT2 },
+        },
+        4);
+    vertex.SetVertex(WE_IN_POSITION, pos);
+    vertex.SetVertex(WE_IN_TEXCOORD, texCoord);
+    mesh.AddVertexArray(std::move(vertex));
+    // Official dest create 0x1402605f9 r9d=4 verts, 0x140260630 [rsp+0x28]=6.
+    // The same slot is the generated index count at 0x14026135d, advanced by 6
+    // per quad (0x140261327). Verts are point0..3 in cyclic order, so the two
+    // triangles are 0,1,2 and 0,2,3. A 4-vert strip in that order leaves
+    // (0,2,3) unfilled.
+    const uint16_t dest_indices[] = { 0, 1, 2, 0, 2, 3 };
+    SceneIndexArray dest_index_array((sizeof(dest_indices) / sizeof(dest_indices[0]) + 1) / 2);
+    dest_index_array.AssignHalf(
+        0, std::span<const uint16_t>(dest_indices, sizeof(dest_indices) / sizeof(dest_indices[0])));
+    mesh.AddIndexArray(std::move(dest_index_array));
+}
+
+void AppendPuppetSurfaceWriter(wpscene::WPImageObject& image, const WPMdl& mdl) {
+    // Official I-internal binds [instance+0x400] when +0x4b0 (0x14020805e). TREE keeps
+    // that skinned draw as a private layer-surface pass after authored ping-pong, then
+    // dest blit publishes the surface RT (0x1401ec6b2). Do not fold this mesh into dest.
+    wpscene::WPImageEffect puppet_effect;
+    wpscene::WPMaterial    puppet_mat = image.material;
+    if (puppet_mat.textures.empty()) puppet_mat.textures.resize(1);
+    puppet_mat.textures[0] = "";
+    WPMdlParser::AddPuppetMatInfo(puppet_mat, mdl);
+    puppet_effect.materials.push_back(std::move(puppet_mat));
+    image.effects.push_back(std::move(puppet_effect));
 }
 
 void GenCardMeshWithTexCoordBounds(SceneMesh& mesh, const std::array<float, 2>& size,
@@ -1762,7 +1788,20 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
         // mirrored from the visible world node so hidden-effect fallbacks keep moving with their
         // compose/text layer.
         composite_data.CopyParallaxContractFrom(*final_transform_data);
+        // Official Path B 0x14018b062 has no attach/final suppress. The visible
+        // dest blit after I pop (0x1401e9dd5) always applies ROOT offset.
+        composite_data.SetParallaxContract(composite_data.parallaxDepth,
+                                           composite_data.parallax_anchor,
+                                           false,
+                                           composite_data.parallaxDepthAuthored);
     }
+
+    // Leftover dest-draw +0x9b0 is dest*VP*S(w/2) (DEST_MVP 0x1401ec51f). Last-pass
+    // g_MVP is +0x930 camera*dest. FinalNode is not 0x1401ebf60 (LEFTOVER_VS_DESTDRAW).
+    composite_data.SetEffectTextureProjection(&effect_layer.FinalNode(),
+                                              &effect_layer.FinalMesh(),
+                                              effect_layer.AuthoredWidth(),
+                                              effect_layer.AuthoredHeight());
 
     auto composite_mesh = std::make_shared<SceneMesh>();
     composite_mesh->AddMaterial(std::move(composite_material));
@@ -1954,7 +1993,7 @@ void RegisterDetachedRenderOrderSource(ParseContext&                     context
     // Effect-backed layers split into a visible world transform node and a root-owned source node.
     // Recording the pair here lets render-graph construction draw the source exactly where the
     // world node appears in authored layer order without duplicating it during root traversal.
-    auto& sources = context.scene->detachedEffectSourceNodesByWorldNode[world_node.get()];
+    auto& sources = context.scene->detachedEffectSourceNodesByLayerNode[world_node.get()];
     if (std::find(sources.begin(), sources.end(), source_node.get()) == sources.end()) {
         sources.push_back(source_node.get());
     }
@@ -1990,15 +2029,15 @@ void RemoveRenderOrderNodeReferences(Scene& scene, SceneNode* node) {
             ++it;
         }
     }
-    for (auto it = scene.detachedEffectSourceNodesByWorldNode.begin();
-         it != scene.detachedEffectSourceNodesByWorldNode.end();) {
+    for (auto it = scene.detachedEffectSourceNodesByLayerNode.begin();
+         it != scene.detachedEffectSourceNodesByLayerNode.end();) {
         if (it->first == node) {
-            it = scene.detachedEffectSourceNodesByWorldNode.erase(it);
+            it = scene.detachedEffectSourceNodesByLayerNode.erase(it);
             continue;
         }
         erase_node_from_vector(it->second);
         if (it->second.empty()) {
-            it = scene.detachedEffectSourceNodesByWorldNode.erase(it);
+            it = scene.detachedEffectSourceNodesByLayerNode.erase(it);
         } else {
             ++it;
         }
@@ -2066,9 +2105,10 @@ std::optional<AttachmentBinding> ResolveAttachmentBinding(const ParseContext& co
     };
 }
 
-bool ConfigureBoneAttachment(ParseContext& context, int32_t parent_id, std::string_view attachment,
-                             const Eigen::Affine3f& local_transform, std::string_view object_kind,
-                             std::string_view object_name, WPShaderValueData& node_data) {
+bool ConfigureBoneAttachment(ParseContext& context, int32_t layer_id, int32_t parent_id,
+                             std::string_view attachment, const Eigen::Affine3f& local_transform,
+                             std::string_view object_kind, std::string_view object_name,
+                             WPShaderValueData& node_data) {
     if (parent_id == 0 || attachment.empty()) return false;
 
     auto parent_node = FindParentNode(context, parent_id);
@@ -2090,10 +2130,21 @@ bool ConfigureBoneAttachment(ParseContext& context, int32_t parent_id, std::stri
         return false;
     }
 
+    Affine3f dest_local = local_transform;
+    if (auto* object = context.scene != nullptr ? context.scene->FindSceneObject(layer_id)
+                                                : nullptr) {
+        // Official image parse 0x1401e6f50 → 0x1401de470 writes +0x180/+0x190
+        // and 0x1401dda60 child-list only. Origin stays +0x128 from setter
+        // 0x1401a4530 (callback 0x1401e0520 only clears +0xd0). Attach-zero
+        // 0x1401de962 runs only when setParent r8 adjustTransforms != 0
+        // (0x1401de925); scene bind 0x14018802c uses r8=0.
+        object->SetAttachBinding(attachment_binding->bone_index, attachment_binding->transform);
+        dest_local = Affine3f(object->ComposeLocalDest());
+    }
     node_data.AttachToBone(parent_node.get(),
                            attachment_binding->bone_index,
                            attachment_binding->transform,
-                           local_transform);
+                           dest_local);
     return true;
 }
 
@@ -2118,34 +2169,6 @@ void AttachNodeToScene(ParseContext& context, const std::shared_ptr<SceneNode>& 
     if (node_data != nullptr) {
         node_data->SetParallaxAnchor(parent.get());
     }
-}
-
-bool ShouldInheritParentParallax(ParseContext& context, const SceneNode& parent,
-                                 const WPShaderValueData& node_data) {
-    if (context.shader_updater == nullptr) return true;
-    if (! node_data.parallaxDepthAuthored) {
-        // Wallpaper Engine stores its numeric default as an omitted field. A root layer with that
-        // field still resolves to the scene default depth, but a child layer uses the parent
-        // parallax contract instead of becoming a separate depth-1 camera source. This check must
-        // precede the numeric comparison because both omitted and explicitly authored `1 1` carry
-        // the same resolved float values.
-        return true;
-    }
-    if (IsZeroParallaxDepth(node_data.parallaxDepth)) return true;
-
-    const auto* parent_data = context.shader_updater->GetNodeData(&parent);
-    if (parent_data == nullptr) return true;
-
-    // Inherited transform and inherited camera-parallax are separate contracts in Wallpaper
-    // Engine. Authored relay layers can be positioned relative to a parent while still carrying
-    // their own parallaxDepth. Keep the old parent-anchor behavior for repaired/suppressed
-    // containers and zero-depth parents, but let explicit child depth survive when both sides
-    // authored their own non-zero parallax values.
-    if (parent_data->suppress_model_parallax || parent_data->IsBoneAttached()) return true;
-    if (parent_data->parallax_anchor != nullptr) return true;
-    if (IsZeroParallaxDepth(parent_data->parallaxDepth)) return true;
-
-    return false;
 }
 
 enum class ParentTransformBindingContract
@@ -2199,10 +2222,10 @@ void ApplyParentTransformContract(ParseContext& context, const ParentTransformCo
     auto parent = FindParentNode(context, contract.parent_id);
     if (! parent) return;
 
+    // PATH_B has no attach/final suppress gate. Parent list +0x158 is flat
+    // (0x140190837); attach writes +0x180/+0x190 only (ATTACH_WRITE).
     const bool inherit_parent_parallax =
-        contract.parallax_anchor == ParentParallaxAnchorContract::ForceAuthoredParent ||
-        (contract.parallax_anchor == ParentParallaxAnchorContract::InheritWhenCompatible &&
-         ShouldInheritParentParallax(context, *parent, node_data));
+        contract.parallax_anchor != ParentParallaxAnchorContract::None;
 
     if (contract.transform_binding ==
         ParentTransformBindingContract::InheritAuthoredParent) {
@@ -2252,7 +2275,9 @@ void ApplyEffectWriterTransformContract(ParseContext& context,
 
     if (contract.projection_layer != nullptr) {
         data.SetEffectTextureProjection(&contract.projection_layer->FinalNode(),
-                                        &contract.projection_layer->FinalMesh());
+                                        &contract.projection_layer->FinalMesh(),
+                                        contract.projection_layer->AuthoredWidth(),
+                                        contract.projection_layer->AuthoredHeight());
         if (contract.binds_puppet_surface) {
             data.SetPuppetSurface(contract.projection_layer,
                                   &contract.projection_layer->FinalMesh());
@@ -2278,18 +2303,6 @@ EffectWriterTransformContract BuildImageEffectFinalCompositeContract(
     EffectWriterTransformContract contract;
     contract.parallax_depth          = ImageObjectParallaxDepth(image);
     contract.parallax_depth_authored = image.parallaxDepthAuthored;
-
-    if (image.parent != 0 && ! image.attachment.empty()) {
-        // A bone-attached image is positioned by the parent puppet before this neutral final
-        // composite is drawn. SyncResolvedNodeToWorld() copies that already-parallaxed world
-        // matrix into the detached final node, while final-composite data deliberately does not
-        // retain the bone binding itself. Applying the child's parsed parallaxDepth again here
-        // therefore adds an independent camera translation after the parent translation. Missing
-        // parallaxDepth now resolves to the normal scene default, so without this explicit
-        // attachment contract a head, eye, or other attached artwork drifts away from its bone.
-        // Match the direct-image path: attachments get exactly the parent puppet's parallax.
-        contract.suppress_own_model_parallax = true;
-    }
 
     if (uses_routed_parent) {
         // Effect-backed image world nodes deliberately force the authored parent as their parallax
@@ -2324,16 +2337,14 @@ ImageEffectWriterRole ResolveImageEffectWriterRole(bool is_compose_layer) {
 }
 
 EffectWriterTransformContract BuildTextEffectFinalCompositeContract(
-    const wpscene::WPTextObject& text) {
+    const ParseContext& context, const wpscene::WPTextObject& text) {
     EffectWriterTransformContract contract;
     contract.parallax_depth          = TextObjectParallaxDepth(text);
     contract.parallax_depth_authored = text.parallaxDepthAuthored;
-    if (LayerUsesRoutedParent(text.parent, text.attachment)) {
+    if (LayerUsesRoutedParent(context, text.parent, text.attachment)) {
         // The route matrix contains the authored parent transform but never shader-time mouse
-        // parallax. Match the normal text-node contract here: zero-depth text inherits the closest
-        // compatible parent parallax anchor, while text with an independent authored depth keeps its
-        // own offset. The final composite then applies exactly one parallax contract instead of
-        // suppressing the only offset available to effect-backed weekday/date labels.
+        // parallax. A parented text writer always inherits that parent camera-parallax source so
+        // the final composite applies exactly one offset.
         contract.parent_transform =
             ParentTransformContract::ParallaxAnchorWhenCompatible(text.parent);
     }
@@ -2379,12 +2390,13 @@ EffectWriterTransformContract BuildImageEffectMaterialContract(
 }
 
 EffectWriterTransformContract BuildTextEffectMaterialContract(
-    const wpscene::WPTextObject& text, SceneImageEffectLayer& effect_layer) {
+    const ParseContext& context, const wpscene::WPTextObject& text,
+    SceneImageEffectLayer& effect_layer) {
     EffectWriterTransformContract contract;
     contract.parallax_depth          = TextObjectParallaxDepth(text);
     contract.parallax_depth_authored = text.parallaxDepthAuthored;
     contract.projection_layer        = &effect_layer;
-    if (LayerUsesRoutedParent(text.parent, text.attachment)) {
+    if (LayerUsesRoutedParent(context, text.parent, text.attachment)) {
         // Text effect nodes start as private bridge passes, but ResolveEffect() may turn the last
         // authored effect node into the visible scene-space writer. Parent-routed text already
         // receives the visual parent chain, including parent camera parallax, through the render
@@ -2399,12 +2411,14 @@ EffectWriterTransformContract BuildTextEffectMaterialContract(
 void RegisterLayerSceneState(ParseContext& context, int32_t layer_id, int32_t parent_id,
                              std::string_view attachment, bool visible) {
     if (context.scene == nullptr || layer_id == 0) return;
+    context.scene->EnsureSceneObject(layer_id);
     context.scene->SetLayerParentBinding(layer_id, parent_id, std::string(attachment));
     context.scene->SetLayerLocalVisibility(layer_id, visible);
 }
 
 void RegisterLogicalImageLayer(ParseContext& context, const wpscene::WPImageObject& wpimgobj,
                                bool defer_runtime_materialization) {
+    NotePassthroughLayer(context, wpimgobj);
     auto node = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
                                             Vector3f(wpimgobj.scale.data()),
                                             Vector3f(wpimgobj.angles.data()),
@@ -2416,6 +2430,7 @@ void RegisterLogicalImageLayer(ParseContext& context, const wpscene::WPImageObje
     node_data.parallaxDepth = { wpimgobj.parallaxDepth[0], wpimgobj.parallaxDepth[1] };
     node_data.parallaxDepthAuthored = wpimgobj.parallaxDepthAuthored;
     ConfigureBoneAttachment(context,
+                            wpimgobj.id,
                             wpimgobj.parent,
                             wpimgobj.attachment,
                             Eigen::Affine3f(node->GetLocalTrans().cast<float>()),
@@ -2423,10 +2438,15 @@ void RegisterLogicalImageLayer(ParseContext& context, const wpscene::WPImageObje
                             wpimgobj.name,
                             node_data);
 
-    if (LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment)) {
+    if (LayerUsesRoutedParent(context, wpimgobj.parent, wpimgobj.attachment)) {
         ConfigureInheritedParentBinding(context, wpimgobj.parent, node_data);
         context.scene->sceneGraph->AppendChild(node);
         RegisterRenderOrderProxyChild(context, wpimgobj.parent, node, wpimgobj.id);
+    } else if (wpimgobj.parent != 0) {
+        if (wpimgobj.attachment.empty()) {
+            ConfigureInheritedParentBinding(context, wpimgobj.parent, node_data);
+        }
+        context.scene->sceneGraph->AppendChild(node);
     } else {
         AttachNodeToScene(context, node, wpimgobj.parent, wpimgobj.name, &node_data);
     }
@@ -2480,6 +2500,7 @@ void RegisterLogicalParticleLayer(ParseContext& context, wpscene::WPParticleObje
     node_data.parallaxDepthAuthored = wppartobj.parallaxDepthAuthored;
 
     ConfigureBoneAttachment(context,
+                            wppartobj.id,
                             wppartobj.parent,
                             wppartobj.attachment,
                             Eigen::Affine3f(node->GetLocalTrans().cast<float>()),
@@ -2487,10 +2508,15 @@ void RegisterLogicalParticleLayer(ParseContext& context, wpscene::WPParticleObje
                             wppartobj.name,
                             node_data);
 
-    if (LayerUsesRoutedParent(wppartobj.parent, wppartobj.attachment)) {
+    if (LayerUsesRoutedParent(context, wppartobj.parent, wppartobj.attachment)) {
         ConfigureInheritedParentBinding(context, wppartobj.parent, node_data);
         context.scene->sceneGraph->AppendChild(node);
         RegisterRenderOrderProxyChild(context, wppartobj.parent, node, wppartobj.id);
+    } else if (wppartobj.parent != 0) {
+        if (wppartobj.attachment.empty()) {
+            ConfigureInheritedParentBinding(context, wppartobj.parent, node_data);
+        }
+        context.scene->sceneGraph->AppendChild(node);
     } else {
         AttachNodeToScene(context, node, wppartobj.parent, wppartobj.name, &node_data);
     }
@@ -2498,6 +2524,9 @@ void RegisterLogicalParticleLayer(ParseContext& context, wpscene::WPParticleObje
     context.object_nodes[wppartobj.id] = node;
     context.scene->objectRuntimeNodes[wppartobj.id].push_back(node.get());
     context.scene->nodeOwners[node.get()] = wppartobj.id;
+    if (auto* object = context.scene->FindSceneObject(wppartobj.id)) {
+        object->set_source_node(node.get());
+    }
     context.shader_updater->SetNodeData(node.get(), node_data);
     RegisterLayerSceneState(
         context, wppartobj.id, wppartobj.parent, wppartobj.attachment, wppartobj.visible);
@@ -2519,6 +2548,7 @@ void RegisterLogicalTextLayer(ParseContext& context,
     node_data.parallaxDepthAuthored = text_obj.parallaxDepthAuthored;
 
     ConfigureBoneAttachment(context,
+                            text_obj.id,
                             text_obj.parent,
                             text_obj.attachment,
                             Eigen::Affine3f(node->GetLocalTrans().cast<float>()),
@@ -2526,10 +2556,15 @@ void RegisterLogicalTextLayer(ParseContext& context,
                             text_obj.name,
                             node_data);
 
-    if (LayerUsesRoutedParent(text_obj.parent, text_obj.attachment)) {
+    if (LayerUsesRoutedParent(context, text_obj.parent, text_obj.attachment)) {
         ConfigureInheritedParentBinding(context, text_obj.parent, node_data);
         context.scene->sceneGraph->AppendChild(node);
         RegisterRenderOrderProxyChild(context, text_obj.parent, node, text_obj.id);
+    } else if (text_obj.parent != 0) {
+        if (text_obj.attachment.empty()) {
+            ConfigureInheritedParentBinding(context, text_obj.parent, node_data);
+        }
+        context.scene->sceneGraph->AppendChild(node);
     } else {
         AttachNodeToScene(context, node, text_obj.parent, text_obj.name, &node_data);
     }
@@ -5029,6 +5064,7 @@ private:
     void RegisterRootNode() {
         WPShaderValueData root_data;
         ConfigureBoneAttachment(context_,
+                                model_obj_.id,
                                 model_obj_.parent,
                                 model_obj_.attachment,
                                 Eigen::Affine3f(root_->GetLocalTrans().cast<float>()),
@@ -5186,6 +5222,7 @@ void ParseModelObj(ParseContext& context, WPModelObject& model_obj) {
 void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                    bool force_runtime_materialization = false) {
     auto& wpimgobj = img_obj;
+    NotePassthroughLayer(context, wpimgobj);
     const auto* visibility_contract = FindLayerVisibilityContract(context, wpimgobj.id);
     const bool  can_defer_hidden_runtime_image = ShouldDeferRuntimeLayerMaterialization(
         context, wpimgobj.id, wpimgobj.visible, visibility_contract, force_runtime_materialization);
@@ -5223,13 +5260,9 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     // it directly into `_rt_default`.
     bool hasEffect =
         hasAuthoredEffect || has_shader_color_blend || is_offscreen_dependency_source;
-    // Detached effect world nodes still need to inherit the parent transform even though they
-    // cannot become real scene-graph children of that parent. SceneScript/property-animation
-    // also needs a dedicated logical/world node for image layers with effects, otherwise runtime
-    // transform updates move the offscreen source quad out of its effect camera and the final
-    // output turns blank.
-    const bool uses_routed_parent = LayerUsesRoutedParent(wpimgobj.parent, wpimgobj.attachment);
-    bool use_detached_effect_world_node = hasEffect && ! isCompose;
+    const bool uses_routed_parent = LayerUsesRoutedParent(context, wpimgobj.parent, wpimgobj.attachment);
+    // Official one object / +0x158 (0x140190837). I is a matrix slot at 0x1401e96ac,
+    // not a second SceneNode identity (SO5 / 0x1401ec720).
     // Screen-bound effect sources are only the fullscreen flag and assets that already mark
     // themselves that way (direct-draw shapes without an authored size). An ortho-sized image
     // layer keeps its authored ping-pong; object scale is applied when that result is composited.
@@ -5283,13 +5316,13 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         puppet != nullptr && puppet->kind == WPMdl::MeshKind::StaticImage;
 
     // wpimgobj.origin[1] = context.ortho_h - wpimgobj.origin[1];
-    auto spWorldNode = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
+    auto spLayerNode = std::make_shared<SceneNode>(Vector3f(wpimgobj.origin.data()),
                                                    Vector3f(wpimgobj.scale.data()),
                                                    Vector3f(wpimgobj.angles.data()),
                                                    wpimgobj.name);
-    LoadAlignment(*spWorldNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
-    spWorldNode->ID() = wpimgobj.id;
-    auto spImgNode = use_detached_effect_world_node ? std::make_shared<SceneNode>() : spWorldNode;
+    LoadAlignment(*spLayerNode, wpimgobj.alignment, { wpimgobj.size[0], wpimgobj.size[1] });
+    spLayerNode->ID() = wpimgobj.id;
+    auto spImgNode = spLayerNode;
     spImgNode->SetName(wpimgobj.name);
     spImgNode->ID() = wpimgobj.id;
 
@@ -5346,6 +5379,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
 
     // mesh
     SceneMesh effct_final_mesh {};
+    SceneMesh puppet_surface_mesh {};
     auto      spMesh = std::make_shared<SceneMesh>();
     auto&     mesh   = *spMesh;
 
@@ -5386,50 +5420,55 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 mapRate = padded_map_rate;
             }
         }
+        // IMAGE_VT_128 0x140209290: leftover +0x2d8 a_TexCoord max is
+        // (tex+0x2c)/(tex+0x20) from the texture header, not g_Texture0Resolution
+        // (that vector is {map,map,map,map} when !mipmap_larger) and not the
+        // sprite card [0,1] contract. Last-pass +0x2e8 UV stays 1,1 (TEXT_2F0).
+        if (auto* object = context.scene->FindSceneObject(wpimgobj.id);
+            object != nullptr && !primary_source_texture.empty()) {
+            auto apply_header = [&](i32 w, i32 h, i32 mw, i32 mh) {
+                if (w <= 0 || h <= 0) return;
+                object->set_leftover_uv(
+                    static_cast<float>(mw > 0 ? mw : w) / static_cast<float>(w),
+                    static_cast<float>(mh > 0 ? mh : h) / static_cast<float>(h));
+            };
+            if (const auto tex_it = context.scene->textures.find(primary_source_texture);
+                tex_it != context.scene->textures.end()) {
+                apply_header(tex_it->second.width, tex_it->second.height, tex_it->second.mapWidth,
+                             tex_it->second.mapHeight);
+            } else if (context.scene->imageParser != nullptr) {
+                const auto header = context.scene->imageParser->ParseHeader(primary_source_texture);
+                apply_header(header.width, header.height, header.mapWidth, header.mapHeight);
+            }
+        }
 
         if (hasAnimatedPuppetMesh) {
             if (hasEffect) {
-                // Effects operate on a rectangular layer-local source, then the original image
-                // material is appended as the authoritative puppet surface writer. Reusing that
-                // material is required because puppet images may carry extra textures and shader
-                // semantics such as iris movement and blink masks that a neutral passthrough cannot
-                // reconstruct from the resolved color texture alone.
                 GenCardMesh(
                     mesh, { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] }, mapRate);
-                WPMdlParser::GenPuppetMesh(effct_final_mesh, *puppet);
-
-                wpscene::WPImageEffect puppet_effect;
-                wpscene::WPMaterial    puppet_mat;
-                puppet_mat             = wpimgobj.material;
-                puppet_mat.textures[0] = "";
-                WPMdlParser::AddPuppetMatInfo(puppet_mat, *puppet);
-                puppet_effect.materials.push_back(std::move(puppet_mat));
-                wpimgobj.effects.push_back(std::move(puppet_effect));
+                WPMdlParser::GenPuppetMesh(puppet_surface_mesh, *puppet);
+                effct_final_mesh.ChangeMeshDataFrom(puppet_surface_mesh);
+                if (auto* object = context.scene->FindSceneObject(wpimgobj.id)) {
+                    object->CaptureImage490Mesh(puppet_surface_mesh);
+                }
+                AppendPuppetSurfaceWriter(wpimgobj, *puppet);
             } else {
                 svData.puppet_layer = shared_puppet_pose;
                 WPMdlParser::GenPuppetMesh(mesh, *puppet);
+                if (auto* object = context.scene->FindSceneObject(wpimgobj.id)) {
+                    object->CaptureImage490Mesh(mesh);
+                }
             }
         } else if (hasStaticImageMesh) {
             if (hasEffect) {
-                // Static image-puppet meshes authored in the puppet slot are final-layer shape
-                // masks, not animated sources. The effect chain still needs a normal layer-sized
-                // source card so filters sample the full media texture, then the resolved writer
-                // uses the authored mesh to clip/crop the final visible image without enabling
-                // skinning uniforms.
                 GenCardMesh(
                     mesh, { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] }, mapRate);
                 WPMdlParser::GenPuppetMesh(effct_final_mesh, *puppet);
             } else {
-                // No-effect static image puppets can draw the authored mesh directly. This keeps
-                // the exported crop geometry and UVs while avoiding any WPPuppet runtime state,
-                // which does not exist for flag-9 static image mesh files.
                 WPMdlParser::GenPuppetMesh(mesh, *puppet);
             }
         } else {
             if (hasAuthoredPuppet) {
-                // Keep this diagnostic tied to the geometry fallback point. The parser error above
-                // explains why the authored puppet was unusable; this line records the rendering
-                // consequence before the rectangular card hides the real cause in visual output.
                 LOG_INFO("ImagePuppetFallback: layer=%d name='%s' puppet='%s' using rectangular "
                          "card mesh",
                          wpimgobj.id,
@@ -5439,17 +5478,25 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             const auto source_mesh_size = wpimgobj.size;
             GenCardMesh(
                 mesh, { (uint16_t)source_mesh_size[0], (uint16_t)source_mesh_size[1] }, mapRate);
-            if (wpimgobj.effectFinalTexCoordBoundsEnabled) {
-                GenCardMeshWithTexCoordBounds(
-                    effct_final_mesh, wpimgobj.size, wpimgobj.effectFinalTexCoordBounds);
+            std::array<std::array<float, 2>, 4> perspective_points {};
+            if (LoadShapePerspectivePoints(wpimgobj, perspective_points)) {
+                GenOfficialShapePerspectiveDestMesh(
+                    effct_final_mesh, wpimgobj.size, perspective_points);
             } else {
-                GenCardMesh(effct_final_mesh,
-                            { (uint16_t)wpimgobj.size[0], (uint16_t)wpimgobj.size[1] });
+                // DEST_DRAW_VERTS / CARD_CENTER: leftover dest-draw +0x2e0 is {2,2} ±1.
+                GenCardMesh(effct_final_mesh, { 2, 2 });
             }
         }
     }
     // material blendmode for last step to use
     auto imgBlendMode = ResolveObjectFinalBlend(material.blenmode, wpimgobj.colorBlendMode);
+    if (wpimgobj.image == "__hanabi_shape_directdraw") {
+        // SHAPE_BLEND / DEST_1F0_WRITERS: shape dest +0x1f0 is enum 2
+        // (0x1402607a0 / 0x140260790). DIRECTDRAW string xrefs only shape
+        // parse 0x140260088. Non-shape dest stays authored unless
+        // IMAGE_DEST_BLEND (colorBlendMode 0x1f or +0x304&0x60==0x20).
+        imgBlendMode = BlendMode::Additive;
+    }
     // disable img material blend, as it's the first effect node now
     if (hasEffect) {
         material.blenmode = BlendMode::Normal;
@@ -5466,9 +5513,10 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
     }
 
     ConfigureBoneAttachment(context,
+                            wpimgobj.id,
                             wpimgobj.parent,
                             wpimgobj.attachment,
-                            Eigen::Affine3f(spWorldNode->GetLocalTrans().cast<float>()),
+                            Eigen::Affine3f(spLayerNode->GetLocalTrans().cast<float>()),
                             "object",
                             wpimgobj.name,
                             svData);
@@ -5495,7 +5543,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 source_camera_height,
                 effect_camera_clip.near_clip,
                 effect_camera_clip.far_clip);
-            scene.cameras.at(nodeAddr)->AttatchNode(spWorldNode);
+            scene.cameras.at(nodeAddr)->AttatchNode(spLayerNode);
             LOG_INFO("SceneCompositionLayerSourceCamera: layer=%d name='%s' camera='%s' "
                      "size=[%d, %d] source-target=[%.3f, %.3f] near=%.3f far=%.3f "
                      "animated-puppet=%s",
@@ -5534,15 +5582,10 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         effect_ppong_a = WE_EFFECT_PPONG_PREFIX_A.data() + nodeAddr;
         effect_ppong_b = WE_EFFECT_PPONG_PREFIX_B.data() + nodeAddr;
         // set image effect
-        // Compose layers keep their source node in the normal scene tree, but their final authored
-        // effect pass is still a detached render-graph node. Give the effect layer a world node
-        // even when the source node is not detached so final output can inherit virtual parent
-        // transforms from render-order proxy groups instead of drawing at the compose layer's local
-        // coordinates.
-        auto* effect_world_node =
-            (use_detached_effect_world_node || isCompose) ? spWorldNode.get() : nullptr;
+        // Official one object / +0x158 (0x140190837). This SceneNode is the
+        // layer handle for leftover dest-draw, not a WorldNode leftover sibling.
         auto imgEffectLayer = std::make_shared<SceneImageEffectLayer>(
-            effect_world_node, wpimgobj.size[0], wpimgobj.size[1], effect_ppong_a, effect_ppong_b);
+            spLayerNode.get(), wpimgobj.size[0], wpimgobj.size[1], effect_ppong_a, effect_ppong_b);
         {
             // Fullscreen image-effect layers are postprocess-style framebuffer passes. Remember
             // that authored shape here so ResolveEffect() can keep their final shader on the
@@ -5550,6 +5593,8 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             // active scene camera.
             imgEffectLayer->SetFullscreen(wpimgobj.fullscreen);
             imgEffectLayer->SetFinalBlend(imgBlendMode);
+            // Official dest factors are +0x1f0 cases only (GFX_BLEND_DESC
+            // 0x14009a32b / 0x14009a2fe). gfx+0x28 bit7 premul stays 0.
             imgEffectLayer->SetCopyBackground(wpimgobj.copybackground);
             const auto source_policy = ResolveImageEffectSourcePolicy(isCompose, wpimgobj);
             imgEffectLayer->SetSourceContributionPolicy(source_policy);
@@ -5566,11 +5611,15 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
                 ResolveHiddenFinalCompositePolicy(wpimgobj));
             imgEffectLayer->SourceMesh().ChangeMeshDataFrom(mesh);
             imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effct_final_mesh);
-            imgEffectLayer->FinalNode().CopyTrans(use_detached_effect_world_node ? *spWorldNode
-                                                                                 : *spImgNode);
-            if (! use_detached_effect_world_node && ! isCompose) {
-                spImgNode->CopyTrans(SceneNode());
+            if (wpimgobj.effects.empty()) {
+                imgEffectLayer->FinalNode().CopyTrans(*spLayerNode);
+                imgEffectLayer->FinalNode().ID() = wpimgobj.id;
+                if (context.scene != nullptr) {
+                    context.scene->nodeOwners[&imgEffectLayer->FinalNode()] = wpimgobj.id;
+                }
             }
+            // Official dest stays on the object (0x140185150 origin→+0x110).
+            // Do not wipe the shared node. I is written at 0x1401ec799 / 0x1401e96ac.
             scene.cameras.at(nodeAddr)->AttatchImgEffect(imgEffectLayer);
         }
         if (hasAnimatedPuppetMesh && puppet->asset_bounds.IsFiniteAndOrdered()) {
@@ -5580,7 +5629,7 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
             imgEffectLayer->SetPuppetSurfaceProjection(BuildPuppetSurfaceProjection(
                 wpimgobj,
                 *puppet,
-                effct_final_mesh,
+                puppet_surface_mesh,
                 puppet_surface_camera,
                 puppet_surface_target,
                 effect_source_size));
@@ -5992,38 +6041,39 @@ void ParseImageObj(ParseContext& context, wpscene::WPImageObject& img_obj,
         } else {
             ConfigureInheritedParentBinding(context, wpimgobj.parent, svData);
         }
-        context.scene->sceneGraph->AppendChild(spWorldNode);
-        RegisterRenderOrderProxyChild(context, wpimgobj.parent, spWorldNode, wpimgobj.id);
+        context.scene->sceneGraph->AppendChild(spLayerNode);
+        RegisterRenderOrderProxyChild(context, wpimgobj.parent, spLayerNode, wpimgobj.id);
+    } else if (wpimgobj.parent != 0) {
+        // Official attach writes +0x180/+0x190 only (0x1401de470). InheritParent
+        // would replace BoneAttachment and drop 0x1401852a6.
+        if (wpimgobj.attachment.empty()) {
+            if (hasEffect) {
+                ConfigureRoutedEffectWorldParentBinding(context, wpimgobj.parent, worldNodeData);
+            } else {
+                ConfigureInheritedParentBinding(context, wpimgobj.parent, svData);
+            }
+        }
+        context.scene->sceneGraph->AppendChild(spLayerNode);
     } else {
-        AttachNodeToScene(context, spWorldNode, wpimgobj.parent, wpimgobj.name, &svData);
+        AttachNodeToScene(context, spLayerNode, wpimgobj.parent, wpimgobj.name, &svData);
     }
-    context.object_nodes[wpimgobj.id]       = spWorldNode;
+    context.object_nodes[wpimgobj.id]       = spLayerNode;
     context.scene->imageLayers[wpimgobj.id] = Scene::ImageLayerRuntimeState {
         .size      = wpimgobj.size,
         .alignment = wpimgobj.alignment,
     };
-    context.scene->objectRuntimeNodes[wpimgobj.id].push_back(spWorldNode.get());
-    context.scene->nodeOwners[spWorldNode.get()] = wpimgobj.id;
+    context.scene->objectRuntimeNodes[wpimgobj.id].push_back(spLayerNode.get());
+    context.scene->nodeOwners[spLayerNode.get()] = wpimgobj.id;
+    if (auto* object = context.scene->FindSceneObject(wpimgobj.id)) {
+        object->set_source_node(spLayerNode.get());
+        if (hasAnimatedPuppetMesh) object->set_puppet_layer(shared_puppet_pose);
+    }
     if (hasAnimatedPuppetMesh) {
         context.object_puppets[wpimgobj.id] = puppet->puppet.get();
     }
-    // Effect-backed image layers usually use a detached source node plus a separate world node:
-    // the source node keeps `svData` so it can render into the private effect camera, while the
-    // world node keeps `worldNodeData` so authored parent transforms and parent-anchored parallax
-    // match Wallpaper Engine's scene hierarchy. Compose layers are the exception because their
-    // image node and world node are the same object. In that case, register the inherited
-    // world-node data on the shared node; otherwise a child compose layer with its own
-    // `parallaxDepth` would ignore a zero-parallax parent and incorrectly drift with the cursor.
-    context.shader_updater->SetNodeData(
-        spImgNode.get(),
-        spImgNode.get() == spWorldNode.get() && hasEffect ? worldNodeData : svData);
-    if (spImgNode.get() != spWorldNode.get()) {
-        context.shader_updater->SetNodeData(spWorldNode.get(), worldNodeData);
-        context.scene->sceneGraph->AppendChild(spImgNode);
-        RegisterDetachedRenderOrderSource(context, spWorldNode, spImgNode, wpimgobj.id);
-        context.scene->objectRuntimeNodes[wpimgobj.id].push_back(spImgNode.get());
-        context.scene->nodeOwners[spImgNode.get()] = wpimgobj.id;
-    }
+    // Official one object (0x140190837). Effect internals write I (0x1401e96ac);
+    // visible blit uses dest after I pop (0x1401e9dd5).
+    context.shader_updater->SetNodeData(spImgNode.get(), hasEffect ? worldNodeData : svData);
     RegisterLayerSceneState(
         context, wpimgobj.id, wpimgobj.parent, wpimgobj.attachment, wpimgobj.visible);
     context.scene->ApplyLayerVisibility(wpimgobj.id);
@@ -6075,12 +6125,14 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     }
 
     const bool has_effect = render_contract.RequiresBridge();
-    auto       spWorldNode = std::make_shared<SceneNode>(Vector3f(text_obj.origin.data()),
+    auto       spLayerNode = std::make_shared<SceneNode>(Vector3f(text_obj.origin.data()),
                                                          Vector3f(text_obj.scale.data()),
                                                          Vector3f(text_obj.angles.data()),
                                                          text_obj.name);
-    spWorldNode->ID()      = text_obj.id;
-    auto spTextNode        = has_effect ? std::make_shared<SceneNode>() : spWorldNode;
+    spLayerNode->ID()      = text_obj.id;
+    // Official text +0x50 is 0x1401e8aa0 (same image draw). One object; I is
+    // the matrix slot at 0x1401e96ac, not a second SceneNode (SO5).
+    auto spTextNode        = spLayerNode;
     spTextNode->SetName(text_obj.name);
     spTextNode->ID() = text_obj.id;
     spTextNode->AddText(primitive);
@@ -6089,9 +6141,10 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
     worldNodeData.parallaxDepth = { text_obj.parallaxDepth[0], text_obj.parallaxDepth[1] };
     worldNodeData.parallaxDepthAuthored = text_obj.parallaxDepthAuthored;
     ConfigureBoneAttachment(context,
+                            text_obj.id,
                             text_obj.parent,
                             text_obj.attachment,
-                            Eigen::Affine3f(spWorldNode->GetLocalTrans().cast<float>()),
+                            Eigen::Affine3f(spLayerNode->GetLocalTrans().cast<float>()),
                             "text object",
                             text_obj.name,
                             worldNodeData);
@@ -6123,17 +6176,12 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
             -1.0f,
             1.0f);
         scene.cameras.at(camera_name)->AttatchNode(context.effect_camera_node);
-        // Effect-backed text draws the canonical glyph primitive into an isolated source target
-        // before authored image effects sample it. Keep that source node on an explicit identity
-        // shader-data contract instead of relying on the visible world node's parallax/attachment
-        // data: the world node is only the final composited output transform, while this node must
-        // fill the bridge camera exactly in local text space.
-        WPShaderValueData text_source_node_data;
-        context.shader_updater->SetNodeData(spTextNode.get(), text_source_node_data);
+        // Official internals write I into [engine+0x30] (0x1401e96ac). Same object,
+        // not a second source identity.
         scene.objectRuntimeCameraNames[text_obj.id].push_back(camera_name);
         spTextNode->SetCamera(camera_name);
 
-        auto imgEffectLayer = std::make_shared<SceneImageEffectLayer>(spWorldNode.get(),
+        auto imgEffectLayer = std::make_shared<SceneImageEffectLayer>(spLayerNode.get(),
                                                                       display_size[0],
                                                                       display_size[1],
                                                                       primitive->bridge.pingpong_a,
@@ -6141,7 +6189,11 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         imgEffectLayer->SetFinalBlend(
             ResolveObjectFinalBlend(BlendMode::Translucent, text_obj.colorBlendMode));
         imgEffectLayer->FinalMesh().ChangeMeshDataFrom(effect_final_mesh);
-        imgEffectLayer->FinalNode().CopyTrans(*spWorldNode);
+        if (text_obj.effects.empty()) {
+            imgEffectLayer->FinalNode().CopyTrans(*spLayerNode);
+            imgEffectLayer->FinalNode().ID() = text_obj.id;
+            scene.nodeOwners[&imgEffectLayer->FinalNode()] = text_obj.id;
+        }
         scene.cameras.at(camera_name)->AttatchImgEffect(imgEffectLayer);
 
         scene.renderTargets[primitive->bridge.pingpong_a] = SceneRenderTarget {
@@ -6198,7 +6250,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                  display_size[0] * 0.5f,
                  display_size[1] * 0.5f);
         const auto finalCompositeTransformData = BuildEffectWriterTransformData(
-            context, BuildTextEffectFinalCompositeContract(text_obj));
+            context, BuildTextEffectFinalCompositeContract(context, text_obj));
         ConfigureEffectFinalComposite(context,
                                       *imgEffectLayer,
                                       primitive->bridge.pingpong_a,
@@ -6347,7 +6399,7 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
                 auto spMesh                             = std::make_shared<SceneMesh>(true);
                 ApplyEffectWriterTransformContract(
                     context,
-                    BuildTextEffectMaterialContract(text_obj, *imgEffectLayer),
+                    BuildTextEffectMaterialContract(context, text_obj, *imgEffectLayer),
                     effect_node_data);
                 const auto authored_textures = effect_material.textures;
                 spMesh->AddMaterial(std::move(effect_material));
@@ -6386,25 +6438,26 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         }
     }
 
-    if (LayerUsesRoutedParent(text_obj.parent, text_obj.attachment)) {
+    if (LayerUsesRoutedParent(context, text_obj.parent, text_obj.attachment)) {
         ConfigureInheritedParentBinding(context, text_obj.parent, worldNodeData);
-        context.scene->sceneGraph->AppendChild(spWorldNode);
-        RegisterRenderOrderProxyChild(context, text_obj.parent, spWorldNode, text_obj.id);
+        context.scene->sceneGraph->AppendChild(spLayerNode);
+        RegisterRenderOrderProxyChild(context, text_obj.parent, spLayerNode, text_obj.id);
+    } else if (text_obj.parent != 0) {
+        if (text_obj.attachment.empty()) {
+            ConfigureInheritedParentBinding(context, text_obj.parent, worldNodeData);
+        }
+        context.scene->sceneGraph->AppendChild(spLayerNode);
     } else {
-        AttachNodeToScene(context, spWorldNode, text_obj.parent, text_obj.name, &worldNodeData);
+        AttachNodeToScene(context, spLayerNode, text_obj.parent, text_obj.name, &worldNodeData);
     }
 
-    context.object_nodes[text_obj.id] = spWorldNode;
-    context.scene->objectRuntimeNodes[text_obj.id].push_back(spWorldNode.get());
-    context.scene->nodeOwners[spWorldNode.get()] = text_obj.id;
-    context.shader_updater->SetNodeData(spWorldNode.get(), worldNodeData);
-
-    if (spTextNode.get() != spWorldNode.get()) {
-        context.scene->sceneGraph->AppendChild(spTextNode);
-        RegisterDetachedRenderOrderSource(context, spWorldNode, spTextNode, text_obj.id);
-        context.scene->objectRuntimeNodes[text_obj.id].push_back(spTextNode.get());
-        context.scene->nodeOwners[spTextNode.get()] = text_obj.id;
+    context.object_nodes[text_obj.id] = spLayerNode;
+    context.scene->objectRuntimeNodes[text_obj.id].push_back(spLayerNode.get());
+    context.scene->nodeOwners[spLayerNode.get()] = text_obj.id;
+    if (auto* object = context.scene->FindSceneObject(text_obj.id)) {
+        object->set_source_node(spLayerNode.get());
     }
+    context.shader_updater->SetNodeData(spLayerNode.get(), worldNodeData);
 
     context.scene->textLayers[text_obj.id] = TextLayerRuntimeState {
         .object            = text_obj,
@@ -6412,8 +6465,9 @@ void ParseTextObj(ParseContext& context, wpscene::WPTextObject& text_obj) {
         .render_contract   = render_contract,
         .applied_alignment = ResolveTextLayerSceneAlignment(text_obj),
     };
+    PublishTextDestDrawMeshes(*context.scene, text_obj.id);
 
-    ApplyTextLayerNodePlacement(spWorldNode.get(),
+    ApplyTextLayerNodePlacement(spLayerNode.get(),
                                 context.scene->textLayers[text_obj.id],
                                 text_obj.origin);
 
@@ -6889,6 +6943,7 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
 
     if (! is_child) {
         ConfigureBoneAttachment(context,
+                                wppartobj.id,
                                 wppartobj.parent,
                                 wppartobj.attachment,
                                 Eigen::Affine3f(spNode->GetLocalTrans().cast<float>()),
@@ -6936,16 +6991,24 @@ void ParseParticleObj(ParseContext& context, wpscene::WPParticleObject& wppartob
         child_ptr.node_parent->AppendChild(spNode);
         svData.InheritParentTransform(child_ptr.node_parent);
     } else {
-        if (LayerUsesRoutedParent(wppartobj.parent, wppartobj.attachment)) {
+        if (LayerUsesRoutedParent(context, wppartobj.parent, wppartobj.attachment)) {
             ConfigureInheritedParentBinding(context, wppartobj.parent, svData);
             context.scene->sceneGraph->AppendChild(spNode);
             RegisterRenderOrderProxyChild(context, wppartobj.parent, spNode, wppartobj.id);
+        } else if (wppartobj.parent != 0) {
+            if (wppartobj.attachment.empty()) {
+                ConfigureInheritedParentBinding(context, wppartobj.parent, svData);
+            }
+            context.scene->sceneGraph->AppendChild(spNode);
         } else {
             AttachNodeToScene(context, spNode, wppartobj.parent, wppartobj.name, &svData);
         }
         context.object_nodes[wppartobj.id] = spNode;
         context.scene->objectRuntimeNodes[wppartobj.id].push_back(spNode.get());
         context.scene->nodeOwners[spNode.get()] = wppartobj.id;
+        if (auto* object = context.scene->FindSceneObject(wppartobj.id)) {
+            object->set_source_node(spNode.get());
+        }
         RegisterLayerSceneState(
             context, wppartobj.id, wppartobj.parent, wppartobj.attachment, wppartobj.visible);
         context.scene->ApplyLayerVisibility(wppartobj.id);
@@ -6993,13 +7056,33 @@ void ParseLightObj(ParseContext& context, wpscene::WPLightObject& light_obj) {
     if (light_obj.usecookie && ! light_obj.cookie.empty()) {
         light.setCookie(light_obj.cookie);
     }
+
+    WPShaderValueData svData;
+    svData.parallaxDepth = light_obj.parallaxDepth;
+    if (LayerUsesRoutedParent(context, light_obj.parent, {})) {
+        ConfigureInheritedParentBinding(context, light_obj.parent, svData);
+    } else if (light_obj.parent != 0) {
+        ApplyParentTransformContract(
+            context, ParentTransformContract::ParallaxAnchorWhenCompatible(light_obj.parent), svData);
+    }
+    // Keep the node as a parent source for children; do not shift the light itself.
+    svData.SuppressOwnModelParallax();
+
     context.scene->objectRuntimeLights[light_obj.id].push_back(&light);
     light.setNode(node);
 
-    AttachNodeToScene(context, node, light_obj.parent, light_obj.name);
+    if (light_obj.parent != 0) {
+        context.scene->sceneGraph->AppendChild(node);
+    } else {
+        AttachNodeToScene(context, node, light_obj.parent, light_obj.name, &svData);
+    }
+    context.shader_updater->SetNodeData(node.get(), svData);
     context.object_nodes[light_obj.id] = node;
     context.scene->objectRuntimeNodes[light_obj.id].push_back(node.get());
     context.scene->nodeOwners[node.get()] = light_obj.id;
+    if (auto* object = context.scene->FindSceneObject(light_obj.id)) {
+        object->set_source_node(node.get());
+    }
     RegisterLayerSceneState(context, light_obj.id, light_obj.parent, {}, light_obj.visible);
     context.scene->ApplyLayerVisibility(light_obj.id);
 }
@@ -7019,6 +7102,7 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
     svData.parallaxDepth = empty_obj.parallaxDepth;
     svData.parallaxDepthAuthored = empty_obj.parallaxDepthAuthored;
     ConfigureBoneAttachment(context,
+                            empty_obj.id,
                             empty_obj.parent,
                             empty_obj.attachment,
                             Eigen::Affine3f(node->GetLocalTrans().cast<float>()),
@@ -7026,16 +7110,25 @@ void ParseEmptyObj(ParseContext& context, WPEmptyObject& empty_obj) {
                             empty_obj.name,
                             svData);
 
-    if (LayerUsesRoutedParent(empty_obj.parent, empty_obj.attachment)) {
-        ConfigureInheritedParentBinding(context, empty_obj.parent, svData);
+    if (empty_obj.parent != 0) {
+        // Official attach writes +0x180/+0x190 only (0x1401de470). Image factory
+        // 0x1401902b6 constructs 0x4d0 objects at 0x1401fac50 and installs
+        // vt 0x1404911a8: vt+0x70 0x1401fd510 / vt+0x78 0x1401fd5c0. Inherit
+        // would replace BoneAttachment and drop that dest path. Same guard as
+        // the image flat list at the attachment.empty() check.
+        if (empty_obj.attachment.empty()) {
+            ConfigureInheritedParentBinding(context, empty_obj.parent, svData);
+        }
         context.scene->sceneGraph->AppendChild(node);
-        RegisterRenderOrderProxyChild(context, empty_obj.parent, node, empty_obj.id);
     } else {
         AttachNodeToScene(context, node, empty_obj.parent, empty_obj.name, &svData);
     }
     context.object_nodes[empty_obj.id] = node;
     context.scene->objectRuntimeNodes[empty_obj.id].push_back(node.get());
     context.scene->nodeOwners[node.get()] = empty_obj.id;
+    if (auto* object = context.scene->FindSceneObject(empty_obj.id)) {
+        object->set_source_node(node.get());
+    }
     context.shader_updater->SetNodeData(node.get(), svData);
     RegisterLayerSceneState(
         context, empty_obj.id, empty_obj.parent, empty_obj.attachment, empty_obj.visible);
@@ -7096,88 +7189,13 @@ bool ShapeEffectRequestsDirectDraw(const WPShapeObject& shape_obj) {
     });
 }
 
-std::string ToLowerAscii(std::string_view text) {
-    std::string lower;
-    lower.reserve(text.size());
-    for (unsigned char ch : text) {
-        lower.push_back(static_cast<char>(std::tolower(ch)));
-    }
-    return lower;
-}
-
-bool EffectLooksLikeLightshafts(const wpscene::WPImageEffect& effect) {
-    auto matches = [](std::string_view text) {
-        const std::string lower = ToLowerAscii(text);
-        return lower.find("lightshafts") != std::string::npos ||
-               lower.find("light shafts") != std::string::npos;
-    };
-
-    if (matches(effect.name)) return true;
-    for (const auto& material : effect.materials) {
-        if (matches(material.shader)) return true;
-    }
-    return false;
-}
-
-void MergeLightshaftPointValues(
-    const std::unordered_map<std::string, std::vector<float>>& values,
-    std::array<std::optional<std::array<float, 2>>, 4>&        points) {
-    for (const auto& [name, value] : values) {
-        if (value.size() < 2 || ! std::isfinite(value[0]) || ! std::isfinite(value[1])) continue;
-
-        const std::string lower = ToLowerAscii(name);
-        for (usize i = 0; i < points.size(); i++) {
-            const std::string point_name = "point" + std::to_string(i);
-            if (lower == point_name || lower == "g_" + point_name) {
-                points[i] = std::array<float, 2> { value[0], value[1] };
-                break;
-            }
-        }
-    }
-}
-
-std::optional<std::array<float, 4>>
-ResolveLightshaftsDirectDrawFinalTexCoordBounds(const WPShapeObject& shape_obj) {
-    for (const auto& effect : shape_obj.effects) {
-        if (! EffectLooksLikeLightshafts(effect)) continue;
-
-        std::array<std::optional<std::array<float, 2>>, 4> points;
-        for (usize material_index = 0; material_index < effect.materials.size(); material_index++) {
-            MergeLightshaftPointValues(effect.materials[material_index].constantshadervalues,
-                                       points);
-            if (material_index < effect.passes.size()) {
-                MergeLightshaftPointValues(effect.passes[material_index].constantshadervalues,
-                                           points);
-            }
-        }
-
-        if (! std::all_of(points.begin(), points.end(), [](const auto& point) {
-                return point.has_value();
-            })) {
-            continue;
-        }
-
-        std::array<float, 4> bounds { 0.0f, 0.0f, 1.0f, 1.0f };
-        for (const auto& point : points) {
-            bounds[0] = std::min(bounds[0], point->at(0));
-            bounds[1] = std::min(bounds[1], point->at(1));
-            bounds[2] = std::max(bounds[2], point->at(0));
-            bounds[3] = std::max(bounds[3], point->at(1));
-        }
-
-        const bool expands_default_quad = bounds[0] < 0.0f || bounds[1] < 0.0f ||
-                                          bounds[2] > 1.0f || bounds[3] > 1.0f;
-        if (expands_default_quad) return bounds;
-    }
-
-    return std::nullopt;
-}
-
 std::array<float, 2> ResolveImplicitDirectDrawShapeVisualSize(const ParseContext& context) {
-    const float scene_width  = static_cast<float>(std::max(1, context.ortho_w));
-    const float scene_height = static_cast<float>(std::max(1, context.ortho_h));
-    const float short_edge   = std::min(scene_width, scene_height);
-    return { short_edge, short_edge };
+    // Shape parse vt+0x40 0x14025fac0: movd xmm0, [scene+0x88]; pshufd 0;
+    // cvtdq2ps; movsd [obj+0x2f0], xmm1. scene+0x88 is orthogonalprojection
+    // height (0x1401875f2 / 0x1401875fb). Both +0x2f0 and +0x2f4 get that
+    // integer as float, so the implicit card is height×height.
+    const float height = static_cast<float>(std::max(1, context.ortho_h));
+    return { height, height };
 }
 
 struct DirectDrawShapeMetrics {
@@ -7198,22 +7216,10 @@ DirectDrawShapeMetrics ResolveDirectDrawShapeMetrics(const ParseContext& context
         metrics.visual_size        = shape_obj.size;
         metrics.effect_source_size = shape_obj.size;
     } else {
-        // Source-less DIRECTDRAW quads carry three separate size contracts. Their visible shader
-        // domain follows the scene short edge, while the intermediate effect buffers bind to the
-        // live framebuffer. This preserves world transforms without forcing the layer through the
-        // fullscreen postprocess path.
-        metrics.visual_size                = ResolveImplicitDirectDrawShapeVisualSize(context);
-        metrics.effect_source_size         = { 0.0f, 0.0f };
-        metrics.effect_source_screen_bound = true;
-        metrics.visual_policy              = "implicit-short-edge-square";
-        metrics.effect_source_policy       = "screen-bound";
-    }
-
-    if (auto bounds = ResolveLightshaftsDirectDrawFinalTexCoordBounds(shape_obj);
-        bounds.has_value()) {
-        metrics.final_texcoord_bounds_enabled = true;
-        metrics.final_texcoord_bounds         = *bounds;
-        metrics.final_uv_policy               = "lightshafts-control-points";
+        metrics.visual_size        = ResolveImplicitDirectDrawShapeVisualSize(context);
+        metrics.effect_source_size = metrics.visual_size;
+        metrics.visual_policy      = "implicit-ortho-height-square";
+        metrics.effect_source_policy = "layer-size";
     }
 
     return metrics;
@@ -7270,15 +7276,9 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
         transparent_source_material.textures.resize(1);
     }
     transparent_source_material.textures[0] = std::string(kSyntheticDirectDrawShapeTextureName);
-    // Direct-draw shape effects author their visible pixels inside the effect shader and leave
-    // untouched areas with alpha zero. Treat the final synthetic source as additive for every
-    // shape direct-draw layer: the shader output is authored as generated contribution over the
-    // existing scene, and translucent alpha compositing would multiply the destination by
-    // `1 - alpha`, causing rays and other generated highlights to darken the wallpaper instead of
-    // adding energy. The source texture itself is transparent, so additive blending keeps empty
-    // regions neutral while preserving the intended brightening behavior.
-    const std::string_view direct_draw_final_blend = "additive";
-    transparent_source_material.blending           = std::string(direct_draw_final_blend);
+    // Official assets/materials/util/effectpassthrough.json and
+    // materials/effects/lightshafts.json both author blending "normal".
+    // Image ctor / shape parse do not rewrite that to additive.
 
     const DirectDrawShapeMetrics metrics = ResolveDirectDrawShapeMetrics(context, shape_obj);
 
@@ -7314,9 +7314,8 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
 
     LOG_INFO("SceneShapeDirectDraw: materialize layer=%d name='%s' shape='%s' effects=%zu "
              "visual-size=[%.3f, %.3f] visual-policy=%s effect-source-policy=%s "
-             "effect-source-size=[%.3f, %.3f] authored-size=%s final-uv-policy=%s "
-             "final-uv-bounds=[%.3f, %.3f, %.3f, %.3f] transparent-texture='%.*s' "
-             "final-blend='%.*s'",
+             "effect-source-size=[%.3f, %.3f] authored-size=%s transparent-texture='%.*s' "
+             "source-blend='%s'",
              image_obj.id,
              image_obj.name.c_str(),
              shape_obj.shape.c_str(),
@@ -7328,15 +7327,9 @@ void ParseShapeObj(ParseContext& context, WPShapeObject& shape_obj,
              image_obj.effectSourceSize[0],
              image_obj.effectSourceSize[1],
              shape_obj.has_size ? "true" : "false",
-             metrics.final_uv_policy,
-             metrics.final_texcoord_bounds[0],
-             metrics.final_texcoord_bounds[1],
-             metrics.final_texcoord_bounds[2],
-             metrics.final_texcoord_bounds[3],
              static_cast<int>(kSyntheticDirectDrawShapeTextureName.size()),
              kSyntheticDirectDrawShapeTextureName.data(),
-             static_cast<int>(direct_draw_final_blend.size()),
-             direct_draw_final_blend.data());
+             image_obj.material.blending.c_str());
 
     ParseImageObj(context, image_obj, force_runtime_materialization);
 }
@@ -7447,6 +7440,84 @@ int32_t GetObjectParentId(const WPObjectVar& obj) {
                           },
                       },
                       obj);
+}
+
+std::string GetObjectAttachment(const WPObjectVar& obj) {
+    return std::visit(visitor::overload {
+                          [](const wpscene::WPSoundObject&) {
+                              return std::string {};
+                          },
+                          [](const wpscene::WPLightObject&) {
+                              return std::string {};
+                          },
+                          [](const auto& value) {
+                              return value.attachment;
+                          },
+                      },
+                      obj);
+}
+
+void FillSceneObjectIdentity(Scene& scene, const WPObjectVar& obj) {
+    std::visit(
+        visitor::overload {
+            [&scene](const wpscene::WPSoundObject& value) {
+                if (value.id == 0) return;
+                auto& object = scene.EnsureSceneObject(value.id);
+                object.set_kind(SceneObjectKind::Sound);
+                object.set_name(value.name);
+                object.set_local_visible(value.visible);
+            },
+            [&scene](const auto& value) {
+                if (value.id == 0) return;
+                auto& object = scene.EnsureSceneObject(value.id);
+                object.set_name(value.name);
+                object.set_origin(Vector3f(value.origin.data()));
+                object.set_scale(Vector3f(value.scale.data()));
+                object.set_angles(Vector3f(value.angles.data()));
+                object.set_local_visible(value.visible);
+                if constexpr (requires { value.parallaxDepth; }) {
+                    object.set_parallax_depth(
+                        Vector2f(value.parallaxDepth[0], value.parallaxDepth[1]));
+                }
+                if constexpr (requires { value.parallaxDepthAuthored; }) {
+                    object.set_parallax_depth_authored(value.parallaxDepthAuthored);
+                }
+                if constexpr (std::is_same_v<std::decay_t<decltype(value)>, wpscene::WPImageObject>) {
+                    object.set_kind(SceneObjectKind::Image);
+                    // IMAGE_SIZE_PROP 0x1401a4046 writes +0x2f0. Image vt+0x110
+                    // 0x1402065e0 then vt+0xb0 (IMAGE_VT_B0). EFFECT_COUNT +0x320
+                    // is +1 per JSON effect (0x1401e893d, ctor +0x140=0).
+                    object.set_dest_size(value.size[0], value.size[1]);
+                    object.set_effect_count(static_cast<int32_t>(value.effects.size()));
+                    // PARSE_304_BIT4 / PUPPET_304_BIT4: bit4 leftover-MVP
+                    // (IMAGE_VT_F8), not POSTFX last-pass dest-card.
+                    object.ApplyParse304Bit4(value.colorBlendMode);
+                    object.ApplyPuppet304Bit4();
+                    object.PublishDestDrawMeshes();
+                } else if constexpr (std::is_same_v<std::decay_t<decltype(value)>,
+                                                    wpscene::WPParticleObject>) {
+                    object.set_kind(SceneObjectKind::Particle);
+                } else if constexpr (std::is_same_v<std::decay_t<decltype(value)>,
+                                                    wpscene::WPTextObject>) {
+                    object.set_kind(SceneObjectKind::Text);
+                    // EFFECT_COUNT: text vt+0x40 IMAGE_PARSE. +0x2f0 is TEXT_2F0
+                    // layout AABB, not JSON size (TEXT_AABB_FILL).
+                    object.set_effect_count(static_cast<int32_t>(value.effects.size()));
+                    object.ApplyParse304Bit4(value.colorBlendMode);
+                } else if constexpr (std::is_same_v<std::decay_t<decltype(value)>,
+                                                    wpscene::WPLightObject>) {
+                    object.set_kind(SceneObjectKind::Light);
+                } else if constexpr (std::is_same_v<std::decay_t<decltype(value)>, WPModelObject>) {
+                    object.set_kind(SceneObjectKind::Model);
+                } else if constexpr (std::is_same_v<std::decay_t<decltype(value)>, WPShapeObject>) {
+                    object.set_kind(SceneObjectKind::Shape);
+                } else if constexpr (std::is_same_v<std::decay_t<decltype(value)>, WPEmptyObject>) {
+                    object.set_kind(value.is_camera_layer ? SceneObjectKind::Camera
+                                                          : SceneObjectKind::Empty);
+                }
+            },
+        },
+        obj);
 }
 
 bool IsObjectVisible(const WPObjectVar& obj) {
@@ -8552,6 +8623,7 @@ bool InitDynamicParseContext(ParseContext& context, Scene& scene,
     context.user_properties = user_properties;
     context.ortho_w         = scene.ortho[0];
     context.ortho_h         = scene.ortho[1];
+    context.passthrough_layer_ids = scene.passthroughLayerIds;
     PopulateGlobalBaseUniforms(context, scene);
 
     auto effect_it      = scene.cameras.find("effect");
@@ -8722,7 +8794,8 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
     // so preserve the logical visibility first and restore it after the placeholder swap.
     const bool local_visible = scene.GetLayerLocalVisibility(layer_id);
     const auto binding = scene.GetLayerParentBinding(layer_id);
-    const auto apply_placeholder_transform = [layer_id, &binding, &placeholder_node](auto& object) {
+    const auto apply_placeholder_transform = [layer_id, &binding, &placeholder_node,
+                                              &context](auto& object) {
         object.id         = layer_id;
         object.visible    = true;
         object.parent     = binding.parent_id;
@@ -8739,6 +8812,12 @@ bool wallpaper::MaterializeDeferredImageLayer(Scene& scene, int32_t layer_id,
         object.origin         = { translate.x(), translate.y(), translate.z() };
         object.scale          = { scale.x(), scale.y(), scale.z() };
         object.angles         = { rotation.x(), rotation.y(), rotation.z() };
+        if (context.shader_updater != nullptr) {
+            if (const auto* data = context.shader_updater->GetNodeData(placeholder_node.get())) {
+                object.parallaxDepth         = data->parallaxDepth;
+                object.parallaxDepthAuthored = data->parallaxDepthAuthored;
+            }
+        }
     };
 
     scene.objectRuntimeNodes.erase(layer_id);
@@ -8825,6 +8904,12 @@ bool wallpaper::MaterializeDeferredParticleLayer(Scene& scene, int32_t layer_id,
         object.origin         = { translate.x(), translate.y(), translate.z() };
         object.scale          = { scale.x(), scale.y(), scale.z() };
         object.angles         = { rotation.x(), rotation.y(), rotation.z() };
+        if (context.shader_updater != nullptr) {
+            if (const auto* data = context.shader_updater->GetNodeData(placeholder_node.get())) {
+                object.parallaxDepth         = data->parallaxDepth;
+                object.parallaxDepthAuthored = data->parallaxDepthAuthored;
+            }
+        }
     }
 
     scene.objectRuntimeNodes.erase(layer_id);
@@ -8893,6 +8978,12 @@ bool wallpaper::MaterializeDeferredTextLayer(Scene& scene, int32_t layer_id,
         object.origin         = { translate.x(), translate.y(), translate.z() };
         object.scale          = { scale.x(), scale.y(), scale.z() };
         object.angles         = { rotation.x(), rotation.y(), rotation.z() };
+        if (context.shader_updater != nullptr) {
+            if (const auto* data = context.shader_updater->GetNodeData(placeholder_node.get())) {
+                object.parallaxDepth         = data->parallaxDepth;
+                object.parallaxDepthAuthored = data->parallaxDepthAuthored;
+            }
+        }
     }
 
     scene.objectRuntimeNodes.erase(layer_id);
@@ -9109,6 +9200,7 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
         // decisions can mirror Scene::IsLayerVisible() without needing concrete runtime nodes.
         context.initial_parent_by_layer_id[*id] = GetObjectParentId(obj);
     }
+    const std::vector<WPObjectVar> authored_objects = wp_objs;
 
     std::unordered_set<int32_t> hidden_object_ids;
     for (const auto& obj : wp_objs) {
@@ -9216,6 +9308,21 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
     }
 
     InitContext(context, vfs, sc, scene_id);
+    for (const auto& obj : authored_objects) {
+        if (const auto* image = std::get_if<wpscene::WPImageObject>(&obj)) {
+            NotePassthroughLayer(context, *image);
+        }
+    }
+    for (const auto& obj : authored_objects) {
+        FillSceneObjectIdentity(*context.scene, obj);
+    }
+    for (const auto& obj : authored_objects) {
+        const auto id = GetObjectId(obj);
+        if (! id.has_value() || *id == 0) continue;
+        // SO7 0x1401de931 / 0x14018802c: +0x180 parent after factory parse,
+        // adjustTransforms=0 so origin +0x128 is left as 0x1401a4530 wrote it.
+        context.scene->BindSceneObjectParent(*id, GetObjectParentId(obj), GetObjectAttachment(obj));
+    }
     context.scene->has3dModels         = has_3d_models;
     context.layer_visibility_contracts = std::move(layer_visibility_contracts);
     context.scene->soundManager        = &sm;
@@ -9341,8 +9448,6 @@ std::shared_ptr<Scene> WPSceneParser::Parse(std::string_view scene_id, const std
                    },
                    obj);
     }
-
-    ApplyMissingImageParallaxFallbacks(context, wp_objs);
 
     RegisterSceneScripts(context, json);
 

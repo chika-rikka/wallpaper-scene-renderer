@@ -61,14 +61,14 @@ struct ParticleEmitterTiming {
 // clears credit, and zeroes the periodic timer/count. Shared emitter lambdas must not
 // keep this state.
 struct ParticleEmitRuntime {
-    float credit { 0.0f };
-    u32   instantaneous { 0 };
-    float periodic_timer { 0.0f };
-    u32   emitted_this_period { 0 };
-    float delay_remaining { 0.0f };
-    float duration_remaining { 0.0f };
-    bool  duration_limited { false };
-    bool  inactive { false };
+    float    credit { 0.0f };
+    u32      instantaneous { 0 };
+    float    periodic_timer { 0.0f };
+    u32      emitted_this_period { 0 };
+    float    delay_remaining { 0.0f };
+    float    duration_remaining { 0.0f };
+    bool     duration_limited { false };
+    bool     inactive { false };
 };
 
 inline ParticleEmitRuntime MakeParticleEmitRuntime(const ParticleEmitterTiming& timing) {

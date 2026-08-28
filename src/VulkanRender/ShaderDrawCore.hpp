@@ -3,6 +3,7 @@
 #include "Interface/IShaderValueUpdater.h"
 #include "Resource.hpp"
 #include "Scene/Scene.h"
+#include "Scene/SceneShader.h"
 #include "SpriteAnimation.hpp"
 #include "Vulkan/Device.hpp"
 #include "Vulkan/GraphicsPipeline.hpp"
@@ -34,6 +35,8 @@ struct ShaderDrawRequest {
     std::string              camera_override;
     bool                     use_active_camera_for_uniforms { false };
     bool                     use_active_camera_for_parallax { false };
+    bool                     use_identity_model { false };
+    DestDrawPhase            dest_draw_phase { DestDrawPhase::None };
     sprite_map_t             sprites_map;
     bool                     model_pass { false };
     bool                     depth_test { false };
@@ -115,11 +118,13 @@ struct ShaderDrawRecordContext {
 std::optional<vvk::RenderPass> CreateShaderDrawRenderPass(
     const vvk::Device&, VkFormat, VkAttachmentLoadOp, VkImageLayout,
     const ShaderDrawAttachmentDescription& = {},
-    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT, bool resolve_msaa = false);
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT, bool resolve_msaa = false,
+    VkImageLayout color_initial_layout = VK_IMAGE_LAYOUT_UNDEFINED);
 std::string ShaderDrawPipelineCompatibilityKey(
     VkAttachmentLoadOp, bool model_pass, VkAttachmentLoadOp model_depth_load_op,
     const ShaderDrawAttachmentDescription& = {},
-    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT, bool resolve_msaa = false);
+    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT, bool resolve_msaa = false,
+    VkImageLayout color_initial_layout = VK_IMAGE_LAYOUT_UNDEFINED);
 void UpdateShaderDrawUniform(StagingBuffer*, const StagingBufferRef&,
                              const ShaderReflected::Block&, std::string_view,
                              const ShaderValue&);
@@ -165,12 +170,20 @@ public:
     bool referencesRenderTarget(std::string_view) const;
     bool referencesImportedTexture(std::string_view) const;
     void setTexture(u32 index, std::string_view texture_key);
+    // Dest-draw Record writes last-pass g_MVP (Date +0x930 / IMAGE
+    // +0x8f0 stand-in). Not UpdateUniforms.
+    void WriteUniform(std::string_view name, const ShaderValue& value);
+    bool HasUniform(std::string_view name) const;
+    bool UboReady() const { return m_ubo_ready && m_ubo_staging != nullptr; }
 
     const ShaderDrawData& data() const { return m_desc; }
 
 private:
-    ShaderDrawData       m_desc;
-    ShaderDrawExtension* m_extension { nullptr };
+    ShaderDrawData           m_desc;
+    ShaderDrawExtension*     m_extension { nullptr };
+    ShaderReflected::Block   m_ubo_block {};
+    StagingBuffer*           m_ubo_staging { nullptr };
+    bool                     m_ubo_ready { false };
 };
 
 } // namespace wallpaper::vulkan

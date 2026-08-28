@@ -4398,13 +4398,37 @@ void SyncEffectLayerTransforms(WPSceneScriptHost::Opaque* opaque, int32_t layer_
         auto* effect_layer = camera_it->second->GetImgEffect().get();
         if (effect_layer == nullptr) continue;
 
-        if (effect_layer->WorldNode() != nullptr) {
+        if (effect_layer->LayerNode() != nullptr) {
             effect_layer->SyncResolvedNodeToWorld();
         } else {
             effect_layer->SyncResolvedNodeToMatrix(
                 Eigen::Affine3f(node->GetLocalTrans().cast<float>()));
         }
     }
+}
+
+bool ApplyLayerParallaxDepth(WPSceneScriptHost::Opaque* opaque, int32_t layer_id, SceneNode* node,
+                             const std::array<float, 2>& parallax) {
+    bool applied = false;
+    if (opaque != nullptr && opaque->scene != nullptr && layer_id != 0) {
+        if (auto* object = opaque->scene->FindSceneObject(layer_id)) {
+            // 0x1401a4046 / +0x170: thisLayer writes that object only
+            object->set_parallax_depth(Eigen::Vector2f(parallax[0], parallax[1]));
+            object->set_parallax_depth_authored(true);
+            applied = true;
+        }
+    }
+    auto apply   = [&](SceneNode* target) {
+        if (target == nullptr) return;
+        if (auto* data = GetNodeData(opaque, target)) {
+            data->parallaxDepth         = parallax;
+            data->parallaxDepthAuthored = true;
+            applied                     = true;
+        }
+    };
+
+    apply(node);
+    return applied;
 }
 
 const ShaderValue* FindMaterialUniformValue(const SceneMaterial& material,
@@ -5087,14 +5111,26 @@ std::optional<WPDynamicValue> ReadLayerPropertyValue(const WPSceneScriptHost::Op
         }
         return WPDynamicValue(node->Visible());
     }
-    const auto text_layer_id = opaque != nullptr ? FindNodeId(opaque, node) : 0;
-    const auto* text_layer =
-        text_layer_id != 0 ? FindTextLayerById(opaque, text_layer_id) : nullptr;
-    if (text_layer != nullptr && property_name == "origin") {
-        // Text nodes keep their authored origin as the scene translation. Returning the registry value
-        // rather than the node transform still matters for screen-anchored text, where the renderer may
-        // temporarily shift the node into the active camera frame without changing script-visible state.
-        return WPDynamicValue(text_layer->object.origin);
+    if (opaque != nullptr && opaque->scene != nullptr) {
+        const auto layer_id = FindNodeId(opaque, node);
+        if (const auto* object = opaque->scene->FindSceneObject(layer_id)) {
+            if (property_name == "origin") {
+                const auto& value = object->origin();
+                return WPDynamicValue(std::array<float, 3> { value.x(), value.y(), value.z() });
+            }
+            if (property_name == "angles") {
+                const auto& value = object->angles();
+                return WPDynamicValue(std::array<float, 3> { value.x(), value.y(), value.z() });
+            }
+            if (property_name == "scale") {
+                const auto& value = object->scale();
+                return WPDynamicValue(std::array<float, 3> { value.x(), value.y(), value.z() });
+            }
+            if (property_name == "parallaxDepth") {
+                const auto& value = object->parallax_depth();
+                return WPDynamicValue(std::array<float, 2> { value.x(), value.y() });
+            }
+        }
     }
     if (property_name == "origin") {
         const auto& value = node->Translate();
@@ -5502,26 +5538,51 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
         return applied;
     };
 
+    auto write_scene_object_affine = [&](std::string_view name) {
+        // Official dest rebuild 0x140185150: origin +0x128→+0x110, 3×3 = scale*basis.
+        // Text draw 0x1401e8aa0 uses the same SceneObject dest as image. Do not leave
+        // script origin on the SceneNode only.
+        if (opaque == nullptr || opaque->scene == nullptr || layer_id == 0) return;
+        auto* object = opaque->scene->FindSceneObject(layer_id);
+        if (object == nullptr) return;
+        const Eigen::Vector3f v { vector[0], vector[1], vector[2] };
+        if (name == "origin") object->set_origin(v);
+        else if (name == "angles") object->set_angles(v);
+        else if (name == "scale") object->set_scale(v);
+    };
+
     if (property_name == "origin") {
         if (auto text_result = apply_text_layer_transform(property_name);
-            text_result.has_value()) return *text_result;
+            text_result.has_value()) {
+            if (*text_result) write_scene_object_affine(property_name);
+            return *text_result;
+        }
 
+        write_scene_object_affine(property_name);
         node->SetTranslate(Eigen::Vector3f { vector[0], vector[1], vector[2] });
         if (opaque != nullptr) SyncEffectLayerTransforms(opaque, layer_id, node);
         return true;
     }
     if (property_name == "angles") {
         if (auto text_result = apply_text_layer_transform(property_name);
-            text_result.has_value()) return *text_result;
+            text_result.has_value()) {
+            if (*text_result) write_scene_object_affine(property_name);
+            return *text_result;
+        }
 
+        write_scene_object_affine(property_name);
         node->SetRotation(Eigen::Vector3f { vector[0], vector[1], vector[2] });
         if (opaque != nullptr) SyncEffectLayerTransforms(opaque, layer_id, node);
         return true;
     }
     if (property_name == "scale") {
         if (auto text_result = apply_text_layer_transform(property_name);
-            text_result.has_value()) return *text_result;
+            text_result.has_value()) {
+            if (*text_result) write_scene_object_affine(property_name);
+            return *text_result;
+        }
 
+        write_scene_object_affine(property_name);
         node->SetScale(Eigen::Vector3f { vector[0], vector[1], vector[2] });
         if (opaque != nullptr) SyncEffectLayerTransforms(opaque, layer_id, node);
         return true;
@@ -5535,11 +5596,7 @@ bool ApplyLayerPropertyValue(WPSceneScriptHost::Opaque* opaque, SceneNode* node,
                 text_layer->object.parallaxDepthAuthored = true;
             }
         }
-        if (auto* data = GetNodeData(opaque, node)) {
-            data->parallaxDepth = parallax;
-            data->parallaxDepthAuthored = true;
-            return true;
-        }
+        return ApplyLayerParallaxDepth(opaque, layer_id, node, parallax);
     }
 
     return false;
