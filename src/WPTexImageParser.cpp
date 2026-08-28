@@ -39,7 +39,9 @@ namespace
 constexpr std::string_view TEX_HEADER_DIR { "tex-headers01" };
 // Bump when cached sprite-frame UVs or other header fields would be interpreted
 // differently. A version mismatch is a miss; do not rewrite stale records in place.
-constexpr int kTextureHeaderCacheVersion = 5;
+// v6: FIF-embedded payload mips report the padded physical tex+0x20 extent
+// (OFFICIAL_TEX_ALLOC), so cached mipmap_larger/mipmap_pow2 from v5 are stale.
+constexpr int kTextureHeaderCacheVersion = 6;
 
 char* Lz4Decompress(const char* src, int size, int decompressed_size) {
     char* dst       = new char[(usize)decompressed_size];
@@ -182,7 +184,7 @@ bool ReadString(fs::IBinaryStream& file, std::string& value) {
 std::string GetTextureHeaderCachePath(std::string_view cache_namespace, std::string_view name) {
     std::string key;
     key.reserve(cache_namespace.size() + name.size() + 16);
-    key.append("tex-header-v5\n");
+    key.append("tex-header-v6\n");
     key.append(cache_namespace);
     key.push_back('\n');
     key.append(name);
@@ -421,7 +423,18 @@ ImageHeader ParseHeaderUncached(fs::IBinaryStream& file) {
         for (i32 i_mipmap = 0; i_mipmap < mipmap_count; i_mipmap++) {
             i32 width  = file.ReadInt32();
             i32 height = file.ReadInt32();
-            if (i_mipmap == 0) SetHeaderPow2(header, width, height);
+            if (i_mipmap == 0) {
+                // OFFICIAL_TEX_ALLOC: FIF-embedded payload mips are blitted into a
+                // physical tex+0x20 x tex+0x24 allocation at load (see Parse()), so
+                // the header-only mip metadata must describe that same padded extent
+                // or mipmap_larger/g_TextureNResolution disagree with the upload.
+                if (HasEmbeddedImagePayload(header) && ! header.isSprite &&
+                    width <= header.width && height <= header.height) {
+                    width  = header.width;
+                    height = header.height;
+                }
+                SetHeaderPow2(header, width, height);
+            }
 
             bool    LZ4_compressed    = false;
             int32_t decompressed_size = 0;
@@ -533,6 +546,34 @@ std::shared_ptr<Image> WPTexImageParser::Parse(const std::string& name) {
                 if (! decoded_from_tex) {
                     delete[] result;
                     return nullptr;
+                }
+
+                // OFFICIAL_TEX_ALLOC / IMAGE_VT_128 0x140209290: official allocates
+                // the authored physical extent (tex+0x20 x tex+0x24) and blits the
+                // decoded FreeImage payload into its top-left corner, so every
+                // content/physical UV contract (leftover a_TexCoord max
+                // (tex+0x2c)/(tex+0x20), g_TextureNResolution .zw/.xy card mapRate)
+                // samples exactly the payload. FIF-embedded mips store payload-sized
+                // pixels; keeping that payload-sized allocation made those UVs crop a
+                // zoomed subrect of the payload instead (3219908811 前花 651x1247 in a
+                // 1024x2048 container drew 1.57x zoomed and hard-cut at the card edge).
+                if (! img.header.isSprite && img.header.width > 0 && img.header.height > 0) {
+                    const int physical_w = std::max(1, img.header.width >> (int)i_mipmap);
+                    const int physical_h = std::max(1, img.header.height >> (int)i_mipmap);
+                    if ((decoded_width < physical_w || decoded_height < physical_h) &&
+                        decoded_width <= physical_w && decoded_height <= physical_h) {
+                        auto padded =
+                            ImageDataPtr(new uint8_t[(usize)physical_w * (usize)physical_h * 4](),
+                                         [](uint8_t* ptr) { delete[] ptr; });
+                        for (int row = 0; row < decoded_height; row++) {
+                            std::memcpy(padded.get() + (usize)row * (usize)physical_w * 4,
+                                        decoded_data.get() + (usize)row * (usize)decoded_width * 4,
+                                        (usize)decoded_width * 4);
+                        }
+                        decoded_data   = std::move(padded);
+                        decoded_width  = physical_w;
+                        decoded_height = physical_h;
+                    }
                 }
 
                 mipmap.width      = decoded_width;
