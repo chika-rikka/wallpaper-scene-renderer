@@ -53,7 +53,7 @@ using namespace wallpaper::vulkan;
 using wallpaper::DestDrawGfx;
 using wallpaper::DestDrawPhase;
 
-constexpr uint64_t vk_wait_time { 10u * 1000u * 1000000u };
+constexpr uint64_t vk_wait_time { 300u * 1000u * 1000000u };
 constexpr uint32_t vk_command_num { 1 };
 constexpr std::size_t kDeferredPrepareMaxPassesPerFrame { 96 };
 constexpr double      kDeferredPrepareFrameBudgetMs { 2.0 };
@@ -67,9 +67,9 @@ constexpr std::array base_device_exts {
     Extension { false, VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME },
     Extension { true, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME },
     Extension { true, VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME },
-    Extension { true, VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME },
+    Extension { false, VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME },
     Extension { true, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME },
-    Extension { true, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME }
+    Extension { false, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME }
 };
 
 namespace
@@ -891,25 +891,25 @@ void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
     auto update_pass = [](VulkanPass* pass) {
         if (pass != nullptr && pass->prepared()) pass->updateBeforeUpload();
     };
+    // ShaderDrawCore::refreshResources returns false (and
+    // CustomShaderPass unprepares) when a static dest card is
+    // Dirty after TEXT_2F0 AABB growth. Official vt+0xb8 still
+    // Draws this dest-draw; prepare() is the TREE recreate.
+    auto refresh_named = [this, &object, &rr](VulkanPass* pass) {
+        if (pass == nullptr || object.scene() == nullptr) return;
+        if (pass->prepared()) {
+            pass->refreshResources(*object.scene(), *m_device, rr);
+        }
+        if (!pass->prepared()) {
+            pass->prepare(*object.scene(), *m_device, rr);
+        }
+    };
     if (object.kind() == SceneObjectKind::Text && object.effect_count() > 0 &&
         object.scene() != nullptr) {
         // TEXT_2F0 0x140258a02 vt+0xb8 recreates leftover +0x2c8 / FullCompo
         // immediately before leftover Draw. Runtime dest_size can grow past
         // parse JSON+pad (live Date +0x2f0=1412). Refresh leftover TextPass
         // and HORIZONTAL so both Query the same AABB key this DestDraw.
-        auto refresh_named = [this, &object, &rr](VulkanPass* pass) {
-            if (pass == nullptr) return;
-            // ShaderDrawCore::refreshResources returns false (and
-            // CustomShaderPass unprepares) when a static dest card is
-            // Dirty after TEXT_2F0 AABB growth. Official vt+0xb8 still
-            // Draws this dest-draw; prepare() is the TREE recreate.
-            if (pass->prepared()) {
-                pass->refreshResources(*object.scene(), *m_device, rr);
-            }
-            if (!pass->prepared()) {
-                pass->prepare(*object.scene(), *m_device, rr);
-            }
-        };
         if (leftover_it != m_dest_leftover.end()) {
             for (auto* pass : leftover_it->second) refresh_named(pass);
         }
@@ -949,12 +949,26 @@ void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
                 node->Mesh()->ChangeMeshDataFrom(*object.leftover_mesh());
                 node->Mesh()->SetDirty();
             }
-            if (pass->prepared()) {
-                pass->refreshResources(*object.scene(), *m_device, rr);
-            }
-            if (!pass->prepared()) {
-                pass->prepare(*object.scene(), *m_device, rr);
-            }
+            refresh_named(pass);
+        }
+        // PPONG_REBIND: the leftover re-prepare above re-Queries the chain
+        // ping-pong RT by name. The previous frame's final reader already
+        // MarkShareReady()d that name (its m_query_map entry is gone), so
+        // the re-Query may attach the name to a different share-ready
+        // physical image. POSTFX / leftover-MVP / last-pass bound their
+        // sampled views at graph compile; without the same per-frame
+        // re-Query they keep sampling the retired image — the head froze
+        // on its first-frame card and the sleeve+lantern chain vanished
+        // once another layer claimed its old image. TEXT dest-draw above
+        // already refreshes every phase per Record; mirror it for IMAGE.
+        if (postfx_it != m_dest_postfx.end()) {
+            for (auto* pass : postfx_it->second) refresh_named(pass);
+        }
+        if (leftover_mvp_it != m_dest_leftover_mvp.end()) {
+            refresh_named(leftover_mvp_it->second);
+        }
+        if (last_it != m_dest_lastpass.end()) {
+            refresh_named(last_it->second);
         }
     }
     if (leftover_it != m_dest_leftover.end()) {
@@ -990,16 +1004,17 @@ void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
                     pass->writeLastPassInverseSlot(draw);
                 } else if (object.kind() == SceneObjectKind::Text) {
                     // Clock TEXT_VT_F0 +0x320==0 FONT_MVP_SLOT id 0xb
-                    // copies +0x930 (0x1400d8676). TEXT_VT_F0 0x1402580b0
-                    // sets +0x1ca=1 so flush ENGINE_FLUSH 0x1400d4264
-                    // +0x930=camera*dest. Live 3219908811 Clock dest_p is
-                    // BASE+0x40 Path B dest-STACK (T≈parallax, not ctor
-                    // T=0; DEST_LIVE_WRITERS skip-Path-B is stale).
-                    // camera is FitOrtho (LASTPASS_CAM_ORTHO). DestDraw
-                    // already FlushLastPassMvp. +0x594 bit2 clear je
-                    // 0x1402583a8 skips fontbackground +0x2d8. Do not
-                    // write LastPassDrawMvp / +0x8f0 into +0x930.
-                    pass->writeLastPassMvp(object.scene()->LastPassMvp());
+                    // (0x1400d8676): official glyph verts are laid out at
+                    // the object dest before the FONT combo upload
+                    // (DEST_BLIT I*=FetchDest, +0x8f0 = I * +0x930), so
+                    // the uploaded matrix places them on FullFB. Our
+                    // compose glyph_pages stay object-local ±half
+                    // (TEXT_LAYOUT_VERTS), so FetchDest must ride in the
+                    // uploaded matrix: write the +0x8f0 stand-in
+                    // (LastPassDrawMvp), same as IMAGE_VT_F0. Writing
+                    // camera-only +0x930 here dropped the Clock at the
+                    // fit-ortho origin corner (bottom-left desktop).
+                    pass->writeLastPassMvp(object.scene()->LastPassDrawMvp(object));
                 }
             }
         }
@@ -1036,19 +1051,22 @@ void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
     if (last != nullptr && last->prepared()) {
         last->updateBeforeUpload();
         if (object.scene() != nullptr) {
-            // VERTICAL_MVP_ID 0x1400d8676: Date blur VERTICAL g_MVP is id
-            // 0xb copies +0x930 (LastPassMvp). LASTPASS_IMAGE_ID /
-            // UNIFORM_UPLOAD_MAP 0x1400d8749: IMAGE last-pass combo +0x110
-            // is 0xd then 2; that upload is +0x8f0 = LastPassDrawMvp. Do
-            // not copy +0x8f0 into +0x930 (LASTPASS_8F0_T). Clock leftover
-            // is FONT_MVP_SLOT 0xb, not this.
+            // VERTICAL_MVP_ID 0x1400d8676 / LASTPASS_IMAGE_ID /
+            // UNIFORM_UPLOAD_MAP 0x1400d8749: the last-pass Draw happens
+            // after DEST_BLIT folds the object dest into the model slot
+            // (LASTPASS_8F0_T: I*=FetchDest, +0x8f0 = I * +0x930), so the
+            // matrix that reaches the Draw carries FetchDest. The VERTICAL
+            // mesh here is the object-local ±half +0x2e8 card
+            // (POSTFX_MESH 0x1401ec667), so text last-pass needs the same
+            // +0x8f0 stand-in as IMAGE: uploading camera-only +0x930
+            // centered Date/Day at the fit-ortho origin corner instead of
+            // the authored dest on the lantern.
+            const Eigen::Matrix4f draw = object.scene()->LastPassDrawMvp(object);
+            last->writeLastPassMvp(draw);
             if (object.kind() == SceneObjectKind::Image) {
-                const Eigen::Matrix4f draw =
-                    object.scene()->LastPassDrawMvp(object);
-                last->writeLastPassMvp(draw);
+                // IMAGE last-pass combo +0x110 is 0xd then 2; id 0xd
+                // copies +0x8f0 (not inverse(+0x930)).
                 last->writeLastPassInverseSlot(draw);
-            } else {
-                last->writeLastPassMvp(object.scene()->LastPassMvp());
             }
         }
     }

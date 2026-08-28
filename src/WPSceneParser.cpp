@@ -1751,6 +1751,12 @@ bool ConfigureEffectFinalComposite(ParseContext& context, SceneImageEffectLayer&
     // shader variant; mode 31 is expressed by the final fixed-function additive state instead.
     composite_source.combos["BLENDMODE"] =
         UsesShaderColorBlendMode(color_blend_mode) ? color_blend_mode : 0;
+    // The render graph must publish shader-blend layers through this composite:
+    // the owner material stays neutral, so a direct dest-draw of it drops the
+    // blend equation entirely (3219908811 layer 600 colorBlendMode=4 subtract
+    // stamped its 0.4 gray card with ONE/ZERO over `_rt_default`, wiping the
+    // bokeh background and lantern instead of dimming them).
+    effect_layer.SetFinalCompositeShaderColorBlend(UsesShaderColorBlendMode(color_blend_mode));
 
     WPShaderInfo composite_shader_info;
     composite_shader_info.baseConstSvs = context.global_base_uniforms;

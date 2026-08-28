@@ -178,6 +178,18 @@ public:
     bool        FinalCompositeSamplesPremultipliedSource() const {
         return m_final_composite.samples_premultiplied_source;
     }
+    // colorBlendMode 1..30 (PARSE_304_BIT4 +0x32c) is a framebuffer-aware
+    // shader blend: official compiles the layer draw with the BLENDMODE combo
+    // sampling `_rt_FullFrameBuffer`. This parser expresses that equation on
+    // the neutral final composite (ConfigureEffectFinalComposite), so the
+    // publish for such a layer must run through that composite; a plain
+    // fixed-function draw of the layer material cannot reproduce it.
+    bool        FinalCompositeShaderColorBlend() const {
+        return m_final_composite_shader_color_blend;
+    }
+    void        SetFinalCompositeShaderColorBlend(bool shader_blend) {
+        m_final_composite_shader_color_blend = shader_blend;
+    }
     bool        FinalPremultipliedSourceBlend() const {
         return m_final_premultiplied_source_blend;
     }
@@ -294,6 +306,9 @@ private:
     bool                       m_resolved_output_follows_world { true };
     bool                       m_resolved_output_mesh_follows_final_mesh { true };
     FinalCompositeState        m_final_composite;
+    // Parse-time contract; not part of FinalCompositeState because
+    // ResetForResolve() must not clear it between graph rebuilds.
+    bool                       m_final_composite_shader_color_blend { false };
     BlendMode                  m_final_blend { BlendMode::Normal };
     bool                       m_final_premultiplied_source_blend { false };
 

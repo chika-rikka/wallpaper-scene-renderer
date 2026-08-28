@@ -933,11 +933,22 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
     }
 
     auto* dest_object = scene.FindSceneObject(imgId);
+    // PARSE_304_BIT4 shader blend (colorBlendMode 1..30) with +0x320==0:
+    // official Draws the layer with the BLENDMODE combo sampling
+    // `_rt_FullFrameBuffer`. This parser keeps the owner material neutral and
+    // expresses the equation on the final composite, so such layers must stay
+    // on the private-chain + composite route; the IMAGE_VT_F0 leftover FullFB
+    // stamp of the neutral ONE/ZERO material wiped the framebuffer instead of
+    // blending with it (3219908811 layer 600 subtract-gray).
+    const bool bridge_only_shader_blend =
+        imgeff != nullptr && imgeff->FinalCompositeShaderColorBlend() &&
+        dest_object != nullptr && dest_object->effect_count() <= 0;
     const bool dest_leftover_required =
         IsDestDrawObject(dest_object) && dest_object->leftover_mesh() != nullptr &&
         (node == nullptr || node->Text() == nullptr) &&
         (dest_object->effect_count() > 0 ||
-         (dest_object->kind() == SceneObjectKind::Image && !route.compose_source));
+         (dest_object->kind() == SceneObjectKind::Image && !route.compose_source &&
+          !bridge_only_shader_blend));
 
     if (source_route.seed_empty_proxy_compose_from_framebuffer &&
         HasRenderableMeshMaterial(node) && !dest_leftover_required) {
@@ -984,12 +995,17 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
         }
         auto leftover_options = BuildOwnerSourcePassOptions(
             imgeff, output, inherited_output, route, source_route);
-        ApplyDestDrawLeftover(scene, node, imgId, leftover_options);
+        // Shader-blend bridge sources are ordinary effect-source writers into
+        // the private ping-pong; the composite publishes them.
+        if (!bridge_only_shader_blend) {
+            ApplyDestDrawLeftover(scene, node, imgId, leftover_options);
+        }
         // IMAGE_VT_F0 leftover +0x320==0 OMSet is FullFB, not +0x2c8
         // named-RT (IMAGE_DRAW_PASS bit2 clear).
         const std::string_view leftover_output =
             dest_object != nullptr && dest_object->effect_count() <= 0 &&
-                    dest_object->kind() == SceneObjectKind::Image && !route.compose_source
+                    dest_object->kind() == SceneObjectKind::Image && !route.compose_source &&
+                    !bridge_only_shader_blend
                 ? std::string_view(SpecTex_Default)
                 : output;
         AddNodePass(node,
@@ -1157,7 +1173,11 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
     const bool leftover_only_image =
         dest_object_for_resolve != nullptr &&
         dest_object_for_resolve->kind() == SceneObjectKind::Image &&
-        dest_object_for_resolve->effect_count() <= 0 && !route.compose_source;
+        dest_object_for_resolve->effect_count() <= 0 && !route.compose_source &&
+        // Shader-blend bridges have no visible leftover publish of their own;
+        // dropping the effect layer here would also drop the BLENDMODE
+        // composite that carries the layer's only screen contribution.
+        !(imgeff != nullptr && imgeff->FinalCompositeShaderColorBlend());
     if (imgeff != nullptr && leftover_only_image) {
         // IMAGE_VT_F0 leftover +0x320==0 already published Default. Skip
         // ResolveEffect / FinalNode so the layer mesh stays +0x490 +/-half
@@ -1258,6 +1278,13 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
         auto* dest_object = scene.FindSceneObject(imgId);
         const bool dest_draw_effects = dest_object != nullptr && dest_object->DestDrawHasEffects();
         const bool dest_draw_last_pass = DestDrawPublishesDefault(dest_object);
+
+        // IMAGE_VT_F8: the leftover-MVP Draw samples the layer material
+        // after the whole POSTFX chain ran, so track the last resolved
+        // ping-pong the chain writes. Hidden effects keep the chain moving
+        // through their bypass copies, so the last node output is live
+        // either way.
+        std::string final_chain_output;
 
         for (usize i = 0; i < imgeff->EffectCount(); i++) {
             auto& eff     = imgeff->GetEffect(i);
@@ -1372,6 +1399,7 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
                             extra,
                             effect_visible_gate,
                             effect_options);
+                if (!effect_node.output.empty()) final_chain_output = effect_node.output;
                 nodePos++;
             }
             if (!eff->BypassSource().empty() && !eff->BypassTarget().empty() &&
@@ -1406,6 +1434,49 @@ static void ToGraphPass(SceneNode* node, std::string_view inherited_output, i32 
             };
             SceneNode* leftover_mvp_node = dest_object->EnsureLeftoverMvpNode(node);
             if (leftover_mvp_node != nullptr) {
+                // IMAGE_VT_F8 Draws the live layer material after the
+                // POSTFX chain: the combo samples the resolved chain
+                // output under the dest +0x1f0 blend (DEST_1F0_WRITERS /
+                // IMAGE_DEST_BLEND), not the ResolveEffectPingPongChain
+                // Normal source copy. Keeping the parse-time source
+                // texture + ONE/ZERO replace here drew the vinyl and
+                // Frequency cards as opaque white squares over leftover
+                // FullFB (white-disc alpha ignored, chain discarded).
+                if (leftover_mvp_node->Mesh() != nullptr &&
+                    leftover_mvp_node->Mesh()->Material() != nullptr) {
+                    // PARSE_304_BIT4 shader blend: bit4 came from
+                    // colorBlendMode 1..30, so the official leftover-MVP
+                    // Draw runs the BLENDMODE combo sampling
+                    // `_rt_FullFrameBuffer` (genericimage3 g_Texture4).
+                    // This parser keeps the owner material neutral and
+                    // compiles that equation only into the FinalComposite
+                    // material, so the leftover-MVP node must draw that
+                    // material; the neutral owner copy under fixed-function
+                    // FinalBlend turned darken/lighten discs into plain
+                    // translucent stamps.
+                    const SceneMaterial* composite_mat =
+                        imgeff->FinalCompositeShaderColorBlend() &&
+                                imgeff->HasFinalComposite() &&
+                                imgeff->FinalNode().Mesh() != nullptr
+                            ? imgeff->FinalNode().Mesh()->Material()
+                            : nullptr;
+                    if (composite_mat != nullptr &&
+                        dest_object->image_490_mesh() == nullptr) {
+                        leftover_mvp_node->Mesh()->AddMaterial(
+                            SceneMaterial(*composite_mat));
+                    }
+                    auto* mvp_mat = leftover_mvp_node->Mesh()->Material();
+                    mvp_mat->blenmode = imgeff->FinalBlend();
+                    // No-puppet leftover-MVP Draws the ±half +0x2e8 card
+                    // whose UVs are 0..1 == the full chain RT
+                    // (IMAGE_VT_F8 0x1402090fd). Puppet +0x490 verts keep
+                    // source-map UVs (PUPPET_490), so they stay on the
+                    // source texture.
+                    if (dest_object->image_490_mesh() == nullptr &&
+                        !final_chain_output.empty() && !mvp_mat->textures.empty()) {
+                        mvp_mat->textures[0] = final_chain_output;
+                    }
+                }
                 AddNodePass(leftover_mvp_node,
                             SpecTex_Default,
                             imgId,

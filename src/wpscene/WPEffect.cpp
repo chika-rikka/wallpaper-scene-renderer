@@ -181,6 +181,15 @@ bool WPImageEffect::FromJson(const nlohmann::json& json, fs::VFS& vfs) {
     if (json.contains("visible")) {
         visible_json             = json.at("visible");
         ReadVisibleBinding(visible_json, &visible_binding);
+        // Object-shaped visibility carries the authored start value in
+        // "value"; the plain NOWARN read above cannot extract a bool from an
+        // object and silently leaves the default. Script-driven effects such
+        // as media album covers author {script, value:false} and must start
+        // hidden until the script shows them, exactly like WPImageObject's
+        // ReadVisibleProperty contract.
+        if (visible_json.is_object()) {
+            visible = visible_binding.value;
+        }
     }
     if(this->IsEffectBlacklisted(filePath)) {
         // Hide blacklisted effects at parse time so every object type consumes the same sanitized
