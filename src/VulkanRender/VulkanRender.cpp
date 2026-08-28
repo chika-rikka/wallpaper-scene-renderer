@@ -983,14 +983,18 @@ void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
         }
         if (last_it != m_dest_lastpass.end()) refresh_named(last_it->second);
     }
-    if (object.kind() == SceneObjectKind::Image && object.scene() != nullptr &&
-        object.leftover_mesh() != nullptr && leftover_it != m_dest_leftover.end()) {
+    if (object.kind() == SceneObjectKind::Image && object.effect_count() > 0 &&
+        object.scene() != nullptr && object.leftover_mesh() != nullptr &&
+        leftover_it != m_dest_leftover.end()) {
         // IMAGE_2D8_NOFULLFB 0x1401eb180 / IMAGE_VT_E8 0x140208067:
         // leftover Draw +0x2d8 is flags=0 0..AABB, not last-pass
         // +0x2e8 ±half. Owner image Mesh() stays Dynamic() after
         // ChangeMeshDataFrom; rebind the live leftover card before
         // dest-ortho flush so IMAGE leftover is not a puppet/±half
-        // card under dest-ortho (0,W,0,H).
+        // card under dest-ortho (0,W,0,H). Only the +0x320>0 dest-ortho
+        // leftover Draws +0x2d8. IMAGE_VT_F0 (+0x320==0) Draws [+0x490]
+        // ±half under LastPassDrawMvp; forcing the 0..AABB card there
+        // shifted every plain image by +half its dest size.
         for (auto* pass : leftover_it->second) {
             if (auto* node = pass->destDrawNode();
                 node != nullptr && node->Mesh() != nullptr) {
