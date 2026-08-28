@@ -990,16 +990,17 @@ void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
                     pass->writeLastPassInverseSlot(draw);
                 } else if (object.kind() == SceneObjectKind::Text) {
                     // Clock TEXT_VT_F0 +0x320==0 FONT_MVP_SLOT id 0xb
-                    // copies +0x930 (0x1400d8676). TEXT_VT_F0 0x1402580b0
-                    // sets +0x1ca=1 so flush ENGINE_FLUSH 0x1400d4264
-                    // +0x930=camera*dest. Live 3219908811 Clock dest_p is
-                    // BASE+0x40 Path B dest-STACK (T≈parallax, not ctor
-                    // T=0; DEST_LIVE_WRITERS skip-Path-B is stale).
-                    // camera is FitOrtho (LASTPASS_CAM_ORTHO). DestDraw
-                    // already FlushLastPassMvp. +0x594 bit2 clear je
-                    // 0x1402583a8 skips fontbackground +0x2d8. Do not
-                    // write LastPassDrawMvp / +0x8f0 into +0x930.
-                    pass->writeLastPassMvp(object.scene()->LastPassMvp());
+                    // (0x1400d8676): official glyph verts are laid out at
+                    // the object dest before the FONT combo upload
+                    // (DEST_BLIT I*=FetchDest, +0x8f0 = I * +0x930), so
+                    // the uploaded matrix places them on FullFB. Our
+                    // compose glyph_pages stay object-local ±half
+                    // (TEXT_LAYOUT_VERTS), so FetchDest must ride in the
+                    // uploaded matrix: write the +0x8f0 stand-in
+                    // (LastPassDrawMvp), same as IMAGE_VT_F0. Writing
+                    // camera-only +0x930 here dropped the Clock at the
+                    // fit-ortho origin corner (bottom-left desktop).
+                    pass->writeLastPassMvp(object.scene()->LastPassDrawMvp(object));
                 }
             }
         }
@@ -1036,19 +1037,22 @@ void VulkanRender::Impl::Record(wallpaper::SceneObject& object) {
     if (last != nullptr && last->prepared()) {
         last->updateBeforeUpload();
         if (object.scene() != nullptr) {
-            // VERTICAL_MVP_ID 0x1400d8676: Date blur VERTICAL g_MVP is id
-            // 0xb copies +0x930 (LastPassMvp). LASTPASS_IMAGE_ID /
-            // UNIFORM_UPLOAD_MAP 0x1400d8749: IMAGE last-pass combo +0x110
-            // is 0xd then 2; that upload is +0x8f0 = LastPassDrawMvp. Do
-            // not copy +0x8f0 into +0x930 (LASTPASS_8F0_T). Clock leftover
-            // is FONT_MVP_SLOT 0xb, not this.
+            // VERTICAL_MVP_ID 0x1400d8676 / LASTPASS_IMAGE_ID /
+            // UNIFORM_UPLOAD_MAP 0x1400d8749: the last-pass Draw happens
+            // after DEST_BLIT folds the object dest into the model slot
+            // (LASTPASS_8F0_T: I*=FetchDest, +0x8f0 = I * +0x930), so the
+            // matrix that reaches the Draw carries FetchDest. The VERTICAL
+            // mesh here is the object-local ±half +0x2e8 card
+            // (POSTFX_MESH 0x1401ec667), so text last-pass needs the same
+            // +0x8f0 stand-in as IMAGE: uploading camera-only +0x930
+            // centered Date/Day at the fit-ortho origin corner instead of
+            // the authored dest on the lantern.
+            const Eigen::Matrix4f draw = object.scene()->LastPassDrawMvp(object);
+            last->writeLastPassMvp(draw);
             if (object.kind() == SceneObjectKind::Image) {
-                const Eigen::Matrix4f draw =
-                    object.scene()->LastPassDrawMvp(object);
-                last->writeLastPassMvp(draw);
+                // IMAGE last-pass combo +0x110 is 0xd then 2; id 0xd
+                // copies +0x8f0 (not inverse(+0x930)).
                 last->writeLastPassInverseSlot(draw);
-            } else {
-                last->writeLastPassMvp(object.scene()->LastPassMvp());
             }
         }
     }

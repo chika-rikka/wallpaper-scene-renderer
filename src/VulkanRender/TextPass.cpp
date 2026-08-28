@@ -1007,8 +1007,13 @@ void TextPass::execute(const Device& device, RenderingResources& rr) {
         !ensureMeshBuffers(*primitive->background_mesh, m_background_buffers, rr)) {
         return;
     }
+    // TEXT_LAYOUT_VERTS 0..AABB glyphs belong to the named-RT leftover only:
+    // DEST_ORTHO_TNF maps 0..AABB into named-RT NDC. Clock TEXT_VT_F0
+    // (+0x320==0) leftover stays on FullFB, where the Draw uses the compose
+    // ±half glyph layout under the LastPassDrawMvp +0x8f0 stand-in; a 0..AABB
+    // card there lands at the fit-ortho 0..AABB corner (bottom-left desktop).
     const bool leftover_layout_local =
-        m_desc.dest_draw_phase == DestDrawPhase::Leftover &&
+        LeftoverNamedDestDraw(m_desc) &&
         !primitive->leftover_glyph_pages.empty();
     const auto& glyph_pages =
         leftover_layout_local ? primitive->leftover_glyph_pages : primitive->glyph_pages;
